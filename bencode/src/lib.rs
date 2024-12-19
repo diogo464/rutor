@@ -104,7 +104,7 @@ impl<'a> std::fmt::Display for TryDisplayUtf8<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Token<'a> {
+pub enum TokenData<'a> {
     Integer(&'a [u8]),
     ByteString(&'a [u8]),
     ListBegin,
@@ -112,15 +112,22 @@ enum Token<'a> {
     End,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Token<'a> {
+    pub offset: usize,
+    pub length: usize,
+    pub data: TokenData<'a>,
+}
+
 #[derive(Debug, Clone)]
-struct Tokenizer<'a> {
+pub struct Tokenizer<'a> {
     data: &'a [u8],
     offset: usize,
     ahead: Option<Token<'a>>,
 }
 
 impl<'a> Tokenizer<'a> {
-    fn new(data: &'a [u8]) -> Tokenizer<'a> {
+    pub fn new(data: &'a [u8]) -> Tokenizer<'a> {
         Tokenizer {
             data,
             offset: 0,
@@ -128,7 +135,7 @@ impl<'a> Tokenizer<'a> {
         }
     }
 
-    fn next(&mut self) -> Result<Token<'a>> {
+    pub fn next(&mut self) -> Result<Token<'a>> {
         if let Some(token) = self.ahead.take() {
             return Ok(token);
         }
@@ -138,22 +145,37 @@ impl<'a> Tokenizer<'a> {
             b'i' => self.decode_integer(),
             b'0'..=b'9' => self.decode_string(),
             b'l' => {
+                let token = Token {
+                    offset: self.offset,
+                    length: 1,
+                    data: TokenData::ListBegin,
+                };
                 self.offset += 1;
-                Ok(Token::ListBegin)
+                Ok(token)
             }
             b'd' => {
+                let token = Token {
+                    offset: self.offset,
+                    length: 1,
+                    data: TokenData::DictBegin,
+                };
                 self.offset += 1;
-                Ok(Token::DictBegin)
+                Ok(token)
             }
             b'e' => {
+                let token = Token {
+                    offset: self.offset,
+                    length: 1,
+                    data: TokenData::End,
+                };
                 self.offset += 1;
-                Ok(Token::End)
+                Ok(token)
             }
             _ => Err(Error::new(ErrorKind::InvalidData)),
         }
     }
 
-    fn peek(&mut self) -> Result<Token<'a>> {
+    pub fn peek(&mut self) -> Result<Token<'a>> {
         if let Some(token) = self.ahead.clone() {
             Ok(token)
         } else {
@@ -164,13 +186,20 @@ impl<'a> Tokenizer<'a> {
     }
 
     fn decode_integer(&mut self) -> Result<Token<'a>> {
+        let offset = self.offset;
         self.expect_one(b'i')?;
         let integer_arr = self.consume_while(|c| c != b'e');
         self.expect_one(b'e')?;
-        Ok(Token::Integer(integer_arr))
+        let length = self.offset - offset;
+        Ok(Token {
+            offset,
+            length,
+            data: TokenData::Integer(integer_arr),
+        })
     }
 
     fn decode_string(&mut self) -> Result<Token<'a>> {
+        let offset = self.offset;
         let integer_arr = self.consume_while(|c| c != b':');
         self.expect_one(b':')?;
         let integer_str =
@@ -179,7 +208,12 @@ impl<'a> Tokenizer<'a> {
             .parse::<usize>()
             .map_err(|_| Error::new(ErrorKind::InvalidData))?;
         let string = self.consume_n(string_len)?;
-        Ok(Token::ByteString(string))
+        let length = self.offset - offset;
+        Ok(Token {
+            offset,
+            length,
+            data: TokenData::ByteString(string),
+        })
     }
 
     fn peek_one(&self) -> Result<u8> {
@@ -235,14 +269,14 @@ fn parse_integer(v: &[u8]) -> Result<i64> {
         .map_err(|_| Error::new(ErrorKind::InvalidData))
 }
 
-pub enum Value<'a> {
+pub enum ValueData<'a> {
     Integer(i64),
     Bytes(&'a [u8]),
     List(Vec<Value<'a>>),
     Dict(Dict<'a>),
 }
 
-impl<'a> std::fmt::Debug for Value<'a> {
+impl<'a> std::fmt::Debug for ValueData<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Integer(arg0) => f.debug_tuple("Integer").field(arg0).finish(),
@@ -256,24 +290,24 @@ impl<'a> std::fmt::Debug for Value<'a> {
     }
 }
 
-impl<'a> Value<'a> {
+impl<'a> ValueData<'a> {
     pub fn as_integer(&self) -> Result<i64> {
         match self {
-            Value::Integer(v) => Ok(*v),
+            ValueData::Integer(v) => Ok(*v),
             _ => Err(Error::message("expected integer")),
         }
     }
 
     pub fn as_bytes(&self) -> Result<&[u8]> {
         match self {
-            Value::Bytes(v) => Ok(*v),
+            ValueData::Bytes(v) => Ok(*v),
             _ => Err(Error::message("expected byte string")),
         }
     }
 
     pub fn as_str(&self) -> Result<&str> {
         match self {
-            Value::Bytes(v) => match std::str::from_utf8(v) {
+            ValueData::Bytes(v) => match std::str::from_utf8(v) {
                 Ok(str) => Ok(str),
                 _ => Err(Error::message("byte string contains invalid utf-8")),
             },
@@ -283,16 +317,51 @@ impl<'a> Value<'a> {
 
     pub fn as_list(&self) -> Result<&[Value]> {
         match self {
-            Value::List(v) => Ok(v.as_slice()),
+            ValueData::List(v) => Ok(v.as_slice()),
             _ => Err(Error::message("expected list")),
         }
     }
 
     pub fn as_dict(&self) -> Result<&Dict> {
         match self {
-            Value::Dict(dict) => Ok(dict),
+            ValueData::Dict(dict) => Ok(dict),
             _ => Err(Error::message("expected dictonary")),
         }
+    }
+}
+
+pub struct Value<'a> {
+    pub offset: usize,
+    pub length: usize,
+    pub bytes: &'a [u8],
+    pub data: ValueData<'a>,
+}
+
+impl<'a> std::fmt::Debug for Value<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        <ValueData<'a> as std::fmt::Debug>::fmt(&self.data, f)
+    }
+}
+
+impl<'a> Value<'a> {
+    pub fn as_integer(&self) -> Result<i64> {
+        self.data.as_integer()
+    }
+
+    pub fn as_bytes(&self) -> Result<&[u8]> {
+        self.data.as_bytes()
+    }
+
+    pub fn as_str(&self) -> Result<&str> {
+        self.data.as_str()
+    }
+
+    pub fn as_list(&self) -> Result<&[Value]> {
+        self.data.as_list()
+    }
+
+    pub fn as_dict(&self) -> Result<&Dict> {
+        self.data.as_dict()
     }
 }
 
@@ -364,50 +433,78 @@ pub fn decode<T: FromValue>(buf: &[u8]) -> Result<T> {
 }
 
 pub fn decode_value(buf: &[u8]) -> Result<Value> {
-    fn decode_ext<'a>(tokenizer: &mut Tokenizer<'a>) -> Result<Value<'a>> {
+    fn decode_ext<'a>(buf: &'a [u8], tokenizer: &mut Tokenizer<'a>) -> Result<Value<'a>> {
         let token = match tokenizer.next() {
             Ok(token) => token,
             Err(e) if e.kind == ErrorKind::EOF => return Err(Error::new(ErrorKind::UnexpectedEOF)),
             Err(e) => return Err(e),
         };
 
-        match token {
-            Token::Integer(v) => return parse_integer(v).map(Value::Integer),
-            Token::ByteString(v) => return Ok(Value::Bytes(v)),
-            Token::ListBegin => {
+        match token.data {
+            TokenData::Integer(v) => {
+                return Ok(Value {
+                    offset: token.offset,
+                    length: token.length,
+                    bytes: &buf[token.offset..token.offset + token.length],
+                    data: parse_integer(v).map(ValueData::Integer)?,
+                })
+            }
+            TokenData::ByteString(v) => {
+                return Ok(Value {
+                    offset: token.offset,
+                    length: token.length,
+                    bytes: &buf[token.offset..token.offset + token.length],
+                    data: ValueData::Bytes(v),
+                })
+            }
+            TokenData::ListBegin => {
+                let offset = token.offset;
                 let mut values = Vec::new();
                 loop {
                     let peek = tokenizer.peek()?;
-                    if peek == Token::End {
-                        let _ = tokenizer.next();
-                        return Ok(Value::List(values));
+                    if peek.data == TokenData::End {
+                        let end_token = tokenizer.next()?;
+                        let length = end_token.offset - offset + end_token.length;
+                        return Ok(Value {
+                            offset,
+                            length,
+                            bytes: &buf[offset..offset + length],
+                            data: ValueData::List(values),
+                        });
                     }
-                    values.push(decode_ext(tokenizer)?);
+                    values.push(decode_ext(buf, tokenizer)?);
                 }
             }
-            Token::DictBegin => {
+            TokenData::DictBegin => {
+                let offset = token.offset;
                 let mut entries = Vec::new();
                 loop {
                     let peek = tokenizer.peek()?;
-                    if peek == Token::End {
-                        let _ = tokenizer.next()?;
-                        return Ok(Value::Dict(Dict { entries }));
+                    if peek.data == TokenData::End {
+                        let end_token = tokenizer.next()?;
+                        let length = end_token.offset - offset + end_token.length;
+                        return Ok(Value {
+                            offset,
+                            length,
+                            bytes: &buf[offset..offset + length],
+                            data: ValueData::Dict(Dict { entries }),
+                        });
                     }
 
-                    let key = match decode_ext(tokenizer)? {
-                        Value::Bytes(v) => v,
+                    let key = match decode_ext(buf, tokenizer)?.data {
+                        ValueData::Bytes(v) => v,
                         _ => return Err(Error::message("dictionary key must be a binary string")),
                     };
-                    let value = decode_ext(tokenizer)?;
+                    let value = decode_ext(buf, tokenizer)?;
                     entries.push(DictEntry { key, value });
                 }
             }
-            Token::End => return Err(Error::message("unexpected end token")),
+            TokenData::End => return Err(Error::message("unexpected end token")),
         }
     }
 
     let mut tokenizer = Tokenizer::new(buf);
-    decode_ext(&mut tokenizer)
+    decode_ext(buf, &mut tokenizer)
 }
 
 pub trait FromValue: Sized {

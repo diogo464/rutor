@@ -1,0 +1,11 @@
+[package]
+name = "rutor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bencode = { path = "../bencode" }
+reqwest = { version = "0.12.8", features = ["blocking"] }
+serde = { version = "1.0.210", features = ["derive"] }
+sha1 = "0.10.6"
+slotmap = "1.0.7"
