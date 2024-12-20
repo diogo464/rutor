@@ -1,12 +1,13 @@
 use std::{
     collections::VecDeque,
-    io::{BufReader, BufWriter, Read, Write},
+    io::{BufReader, BufWriter, Read, Seek, Write},
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream, UdpSocket},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
 
+use bytes::{Bytes, BytesMut};
 use serde::Serialize;
 use slotmap::{Key as _, SecondaryMap, SlotMap};
 
@@ -627,31 +628,6 @@ fn read_handshake<R: Read>(mut reader: R) -> std::io::Result<Handshake> {
     })
 }
 
-#[derive(Clone)]
-struct Buffer(Arc<[u8]>);
-
-impl std::fmt::Debug for Buffer {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("Buffer").field(&self.0.len()).finish()
-    }
-}
-
-impl Buffer {
-    fn new(buf: &[u8]) -> Self {
-        let mut v = Vec::new();
-        v.extend_from_slice(buf);
-        Self(Arc::from(v.into_boxed_slice()))
-    }
-
-    fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    fn as_bytes(&self) -> &[u8] {
-        &self.0
-    }
-}
-
 #[derive(Default, Clone)]
 pub struct Bitfield {
     data: Vec<u8>,
@@ -680,6 +656,13 @@ impl Bitfield {
         assert!(index < self.bits);
         let byte_index = index / 8;
         self.data[byte_index] |= 1 << (index % 8);
+    }
+
+    fn unset(&mut self, index: u32) {
+        let index = index as usize;
+        assert!(index < self.bits);
+        let byte_index = index / 8;
+        self.data[byte_index] &= !(1 << (index % 8));
     }
 
     fn test(&self, index: u32) -> bool {
@@ -714,27 +697,11 @@ enum Message {
     Unchoke,
     Interested,
     NotInterested,
-    Have {
-        index: u32,
-    },
-    Bitfield {
-        bitfield: Vec<u8>,
-    },
-    Request {
-        index: u32,
-        begin: u32,
-        length: u32,
-    },
-    Piece {
-        index: u32,
-        begin: u32,
-        data: Buffer,
-    },
-    Cancel {
-        index: u32,
-        begin: u32,
-        length: u32,
-    },
+    Have { index: u32 },
+    Bitfield { bitfield: Vec<u8> },
+    Request { index: u32, begin: u32, length: u32 },
+    Piece { index: u32, begin: u32, data: Bytes },
+    Cancel { index: u32, begin: u32, length: u32 },
 }
 
 fn decode_message(buf: &[u8]) -> Message {
@@ -782,7 +749,7 @@ fn decode_message(buf: &[u8]) -> Message {
             // TODO: check len >= 9
             let index = u32::from_be_bytes(buf[1..5].try_into().unwrap());
             let begin = u32::from_be_bytes(buf[5..9].try_into().unwrap());
-            let data = Buffer::new(&buf[9..]);
+            let data = Bytes::copy_from_slice(&buf[9..]);
             Message::Piece { index, begin, data }
         }
         MessageKind::Cancel => {
@@ -860,11 +827,11 @@ fn write_message<W: Write>(mut writer: W, message: &Message) -> std::io::Result<
             Ok(())
         }
         Message::Piece { index, begin, data } => {
-            let len = 8 + data.0.len() as u32;
+            let len = 8 + data.len() as u32;
             write_u32(&mut writer, len)?;
             write_u32(&mut writer, *index)?;
             write_u32(&mut writer, *begin)?;
-            writer.write_all(&data.0)?;
+            writer.write_all(&data)?;
             Ok(())
         }
         Message::Cancel {
@@ -899,19 +866,12 @@ impl PieceKey {
 }
 
 #[derive(Debug, Clone)]
-struct FileRange {
-    key: FileKey,
-    offset: u64,
-    length: u32,
-}
-
-#[derive(Debug, Clone)]
 struct PieceDesc {
     key: PieceKey,
     index: u32,
     hash: Sha1,
     length: u32,
-    ranges: Vec<FileRange>,
+    ranges: Vec<PieceFileRange>,
 }
 
 #[derive(Debug, Clone)]
@@ -954,7 +914,7 @@ impl TorrentDesc {
             });
         }
 
-        let mut offset = 0;
+        let mut file_offset = 0;
         let mut remain = metainfo.info.length;
         let mut piece_ids = Vec::with_capacity(metainfo.info.pieces.len());
         for (piece_idx, piece_hash) in metainfo.info.pieces.iter().enumerate() {
@@ -964,11 +924,11 @@ impl TorrentDesc {
 
             let mut ranges = Vec::new();
             for file in files.values() {
-                ranges.push(FileRange {
-                    key: file.key,
-                    offset,
-                    length,
-                });
+                // ranges.push(PieceFileRange {
+                //     file: file.key,
+                //     file_offset,
+                //     length,
+                // });
             }
 
             let piece_id = pieces.insert_with_key(move |id| PieceDesc {
@@ -980,7 +940,7 @@ impl TorrentDesc {
             });
             piece_ids.push(piece_id);
 
-            offset += u64::from(length);
+            file_offset += u64::from(length);
         }
 
         Self {
@@ -1117,18 +1077,109 @@ fn peer_io_writer(
     let _ = tcp_stream.shutdown(std::net::Shutdown::Both);
 }
 
+enum DiskIOMsg {
+    WritePiece {
+        key: PieceKey,
+        path: PathBuf,
+        offset: u64,
+        data: Bytes,
+    },
+}
+
+#[derive(Debug)]
+struct DiskIO {
+    sender: Sender<DiskIOMsg>,
+}
+
+impl DiskIO {
+    pub fn new(torrent_sender: TorrentSender) -> Self {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || disk_io_entry(receiver, torrent_sender));
+        Self { sender }
+    }
+
+    pub fn write_piece(&self, key: PieceKey, path: &Path, offset: u64, data: Bytes) {
+        self.send(DiskIOMsg::WritePiece {
+            key,
+            path: path.to_path_buf(),
+            offset,
+            data,
+        });
+    }
+
+    fn send(&self, msg: DiskIOMsg) {
+        self.sender.send(msg).expect("disk io should not exit");
+    }
+}
+
+fn disk_io_entry(receiver: Receiver<DiskIOMsg>, sender: TorrentSender) {
+    while let Ok(msg) = receiver.recv() {
+        match msg {
+            DiskIOMsg::WritePiece {
+                key,
+                path,
+                offset,
+                data,
+            } => match attempt_write_piece(&path, offset, &data) {
+                Ok(_) => {}
+                Err(error) => {
+                    let _ = sender.send(TorrentMsg::WritePieceError { key, error });
+                }
+            },
+        }
+    }
+}
+
+fn attempt_write_piece(path: &Path, offset: u64, data: &[u8]) -> std::io::Result<()> {
+    println!("writing piece to {path:?} at offset {offset}");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    file.seek(std::io::SeekFrom::Start(offset))?;
+    file.write_all(data)?;
+    Ok(())
+}
+
 #[derive(Debug)]
 enum TorrentMsg {
-    PeerHandshake { key: PeerKey, id: PeerId },
-    PeerMessage { key: PeerKey, message: Message },
-    PeerError { key: PeerKey, error: std::io::Error },
-    ConnectToPeer { addr: SocketAddr },
+    PeerHandshake {
+        key: PeerKey,
+        id: PeerId,
+    },
+    PeerMessage {
+        key: PeerKey,
+        message: Message,
+    },
+    PeerError {
+        key: PeerKey,
+        error: std::io::Error,
+    },
+    ConnectToPeer {
+        addr: SocketAddr,
+    },
+    WritePieceError {
+        key: PieceKey,
+        error: std::io::Error,
+    },
 }
 
 #[derive(Debug)]
 struct FileState {
     path: PathBuf,
+    offset: u64,
     length: u64,
+}
+
+#[derive(Debug, Clone)]
+struct PieceFileRange {
+    file: FileKey,
+    file_offset: u64,
+    piece_offset: u32,
+    length: u32,
 }
 
 #[derive(Debug)]
@@ -1136,7 +1187,7 @@ struct PieceState {
     hash: Sha1,
     length: u32,
     chunks: Vec<ChunkKey>,
-    ranges: Vec<FileRange>,
+    ranges: Vec<PieceFileRange>,
 }
 
 #[derive(Debug)]
@@ -1146,7 +1197,7 @@ struct ChunkState {
     offset: u32,
     length: u32,
     assigned_peer: Option<PeerKey>,
-    data: Option<Buffer>,
+    data: Option<Bytes>,
 }
 
 #[derive(Debug)]
@@ -1176,6 +1227,7 @@ struct TorrentState {
     info: ArcMetaInfo,
     sender: TorrentSender,
     receiver: TorrentReceiver,
+    disk_io: DiskIO,
     queue: VecDeque<TorrentMsg>,
     bitfield: Bitfield,
     files: SlotMap<FileKey, FileState>,
@@ -1192,13 +1244,19 @@ impl TorrentState {
         let mut files = SlotMap::<FileKey, FileState>::default();
         let mut file_keys = Vec::default();
 
-        for file in info.info.files.iter() {
-            let path = PathBuf::from(file.path.clone());
-            let file_key = files.insert(FileState {
-                path,
-                length: file.length,
-            });
-            file_keys.push(file_key);
+        {
+            let mut current_offset = 0;
+            let parent_path = PathBuf::from(info.info.name.clone());
+            for file in info.info.files.iter() {
+                let path = parent_path.join(PathBuf::from(file.path.clone()));
+                let file_key = files.insert(FileState {
+                    path,
+                    offset: current_offset,
+                    length: file.length,
+                });
+                file_keys.push(file_key);
+                current_offset += file.length;
+            }
         }
 
         for (index, &hash) in info.info.pieces.iter().enumerate() {
@@ -1218,26 +1276,30 @@ impl TorrentState {
             assert_eq!(piece_key.to_index(), index);
 
             let piece_ranges = {
-                let piece_offset = u64::from(index) * info.info.piece_length;
+                let piece_begin = u64::from(index) * info.info.piece_length;
+                let piece_end = piece_begin + u64::from(piece_length);
                 let mut ranges = Vec::default();
-                let mut current_offset = 0;
                 for &file_key in file_keys.iter() {
                     let file = &files[file_key];
-                    let file_begin = current_offset;
+                    let file_begin = file.offset;
                     let file_end = file_begin + file.length;
 
-                    if piece_offset >= file_begin && piece_offset < file_end {
-                        let file_offset = piece_offset - file_begin;
-                        let range_length = (file.length - file_offset).min(u64::from(piece_length));
+                    if (piece_begin >= file_begin && piece_begin < file_end)
+                        || (piece_end >= file_begin && piece_end < file_end)
+                    {
+                        let range_begin = piece_begin.max(file_begin);
+                        let range_end = piece_end.min(file_end);
+                        let range_length = range_end - range_begin;
+                        let file_offset = range_begin - file_begin;
+                        let piece_offset = (range_begin - piece_begin) as u32;
 
-                        ranges.push(FileRange {
-                            key: file_key,
-                            offset: file_offset,
+                        ranges.push(PieceFileRange {
+                            file: file_key,
+                            file_offset,
+                            piece_offset,
                             length: range_length as u32,
                         });
                     }
-
-                    current_offset += file.length;
                 }
 
                 ranges
@@ -1266,11 +1328,13 @@ impl TorrentState {
 
         let (sender, receiver) = std::sync::mpsc::channel();
         let bitfield = Bitfield::empty(info.info.pieces.len());
+        let disk_io = DiskIO::new(sender.clone());
         Self {
             id: Default::default(),
             info: Arc::new(info),
             sender,
             receiver,
+            disk_io,
             queue: Default::default(),
             bitfield,
             files,
@@ -1301,6 +1365,9 @@ impl TorrentState {
             TorrentMsg::PeerMessage { key, message } => self.process_peer_message(key, message),
             TorrentMsg::PeerError { key, error } => self.process_peer_error(key, error),
             TorrentMsg::ConnectToPeer { addr } => self.process_connect_to_peer(addr),
+            TorrentMsg::WritePieceError { key, error } => {
+                self.process_write_piece_error(key, error)
+            }
         }
     }
 
@@ -1461,7 +1528,7 @@ impl TorrentState {
         });
     }
 
-    fn process_received_chunk(&mut self, peer_key: PeerKey, chunk_key: ChunkKey, data: Buffer) {
+    fn process_received_chunk(&mut self, peer_key: PeerKey, chunk_key: ChunkKey, data: Bytes) {
         println!("received chunk");
 
         let peer = &mut self.peers[peer_key];
@@ -1481,6 +1548,12 @@ impl TorrentState {
         self.attempt_finalize_piece(piece_key);
     }
 
+    fn process_write_piece_error(&mut self, piece_key: PieceKey, error: std::io::Error) {
+        let piece_index = piece_key.to_index();
+        println!("failed to write piece {piece_index}: {error}");
+        self.bitfield.unset(piece_index);
+    }
+
     fn attempt_finalize_piece(&mut self, piece_key: PieceKey) {
         let piece = &self.pieces[piece_key];
         let complete = piece
@@ -1492,20 +1565,31 @@ impl TorrentState {
             return;
         }
 
-        let mut data = Vec::with_capacity(piece.length as usize);
+        let mut data = BytesMut::with_capacity(piece.length as usize);
         for &chunk_key in piece.chunks.iter() {
             let chunk = &mut self.chunks[chunk_key];
             let chunk_data = chunk.data.take().unwrap(); // Safety: we know it is present from
                                                          // above
-            data.extend_from_slice(chunk_data.as_bytes());
+            data.extend_from_slice(&chunk_data);
         }
+        let data = data.freeze();
 
         // TODO: move this off thread, it is a bottleneck.
         let hash = Sha1::hash(&data);
         if hash == piece.hash {
             let piece_index = piece_key.to_index();
             self.bitfield.set(piece_index);
-            // TODO: write to disk
+            for range in piece.ranges.iter() {
+                let file = &self.files[range.file];
+                self.disk_io.write_piece(
+                    piece_key,
+                    &file.path,
+                    range.file_offset,
+                    data.slice(
+                        range.piece_offset as usize..(range.piece_offset + range.length) as usize,
+                    ),
+                );
+            }
             println!("finalized piece {piece_index}");
         } else {
             for &chunk_key in piece.chunks.iter() {
@@ -1632,6 +1716,25 @@ fn torrent_entry(mut state: TorrentState) {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let content = std::fs::read("bunny.torrent").unwrap();
     let metainfo = bencode::decode::<Metainfo>(&content).unwrap();
+
+    // let torrent_state = TorrentState::from_metainfo(metainfo.clone());
+    // for (_file_key, file) in torrent_state.files.iter() {
+    //     println!("{:?}", file.path);
+    //     println!("\tlength = {}", file.length);
+    // }
+    // println!();
+    // for (piece_key, piece) in torrent_state.pieces.iter() {
+    //     println!("piece {}", piece_key.to_index());
+    //     for range in piece.ranges.iter() {
+    //         let file = &torrent_state.files[range.file];
+    //         println!(
+    //             "\toffset = {} length = {} file = {:?}",
+    //             range.offset, range.length, file.path
+    //         );
+    //     }
+    // }
+    // return Ok(());
+
     let torrent = Torrent::new(metainfo);
     torrent.connect_to_peer("127.0.0.1:51413".parse()?);
     std::thread::sleep(Duration::from_secs(30));
