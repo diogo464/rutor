@@ -672,6 +672,18 @@ impl Bitfield {
         (self.data[byte_index] & 1 << (index % 8)) != 0
     }
 
+    fn complete(&self) -> bool {
+        if !self.data.iter().take(self.bits / 8).all(|&b| b == 0xFF) {
+            return false;
+        }
+        if self.bits % 8 != 0 {
+            if self.data[self.data.len() - 1] != !(1 << self.bits % 8) {
+                return false;
+            }
+        }
+        true
+    }
+
     fn contains_missing_in(&self, other: &Self) -> bool {
         assert_eq!(self.bits, other.bits);
         for (&lhs, &rhs) in self.data.iter().zip(other.data.iter()) {
@@ -866,7 +878,7 @@ impl PieceKey {
 }
 
 const CHUNK_LENGTH: u32 = 16 * 1024;
-const MAX_PEER_PENDING_CHUNKS: usize = 8;
+const MAX_PEER_PENDING_CHUNKS: usize = 128;
 
 type Sender<T> = std::sync::mpsc::Sender<T>;
 type Receiver<T> = std::sync::mpsc::Receiver<T>;
@@ -1044,7 +1056,7 @@ fn disk_io_entry(receiver: Receiver<DiskIOMsg>, sender: TorrentSender) {
 }
 
 fn attempt_write_piece(path: &Path, offset: u64, data: &[u8]) -> std::io::Result<()> {
-    println!("writing piece to {path:?} at offset {offset}");
+    //println!("writing piece to {path:?} at offset {offset}");
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -1055,6 +1067,106 @@ fn attempt_write_piece(path: &Path, offset: u64, data: &[u8]) -> std::io::Result
     file.seek(std::io::SeekFrom::Start(offset))?;
     file.write_all(data)?;
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct NetworkStats {
+    pub download: u64,
+    pub upload: u64,
+    pub download_rate: u32,
+    pub upload_rate: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct NetworkStatsAccum {
+    total_download: u64,
+    total_upload: u64,
+    download_rate: u32,
+    upload_rate: u32,
+    download_acum: u32,
+    upload_acum: u32,
+    last_download: Instant,
+    last_upload: Instant,
+    period: Duration,
+}
+
+impl NetworkStatsAccum {
+    pub fn new(period: Duration) -> Self {
+        Self {
+            total_download: 0,
+            total_upload: 0,
+            download_rate: 0,
+            upload_rate: 0,
+            download_acum: 0,
+            upload_acum: 0,
+            last_download: Instant::now(),
+            last_upload: Instant::now(),
+            period,
+        }
+    }
+
+    pub fn add_download(&mut self, num_bytes: u32) {
+        self.total_download += num_bytes as u64;
+        if self.last_download.elapsed() > self.period {
+            self.last_download = Instant::now();
+            self.download_rate = self.download_acum / self.period.as_secs() as u32;
+            self.download_acum = num_bytes;
+        } else {
+            self.download_acum += num_bytes;
+        }
+    }
+
+    pub fn add_upload(&mut self, num_bytes: u32) {
+        self.total_upload += num_bytes as u64;
+        if self.last_upload.elapsed() > self.period {
+            self.last_upload = Instant::now();
+            self.upload_rate = self.upload_acum / self.period.as_secs() as u32;
+            self.upload_acum = num_bytes;
+        } else {
+            self.upload_acum += num_bytes;
+        }
+    }
+
+    /// download rate in bytes/sec
+    pub fn download_rate(&self) -> u32 {
+        if self.last_download.elapsed() > self.period {
+            0
+        } else {
+            self.download_rate
+        }
+    }
+
+    /// upload rate in bytes/sec
+    pub fn upload_rate(&self) -> u32 {
+        if self.last_upload.elapsed() > self.period {
+            0
+        } else {
+            self.upload_rate
+        }
+    }
+
+    pub fn total_download(&self) -> u64 {
+        self.total_download
+    }
+
+    pub fn total_upload(&self) -> u64 {
+        self.total_upload
+    }
+
+    pub fn stats(&self) -> NetworkStats {
+        NetworkStats {
+            download: self.total_download(),
+            upload: self.total_upload(),
+            download_rate: self.download_rate(),
+            upload_rate: self.upload_rate(),
+        }
+    }
+}
+
+impl Default for NetworkStatsAccum {
+    fn default() -> Self {
+        Self::new(Duration::from_secs_f64(1.5))
+    }
 }
 
 #[derive(Debug)]
@@ -1077,6 +1189,12 @@ enum TorrentMsg {
     WritePieceError {
         key: PieceKey,
         error: std::io::Error,
+    },
+    NetworkStats {
+        res: Sender<NetworkStats>,
+    },
+    Completed {
+        res: Sender<bool>,
     },
 }
 
@@ -1147,6 +1265,7 @@ struct TorrentState {
     pieces: SecondaryMap<PieceKey, PieceState>,
     chunks: SlotMap<ChunkKey, ChunkState>,
     peers: SlotMap<PeerKey, PeerState>,
+    network_stats: NetworkStatsAccum,
     last_tick: Instant,
 }
 
@@ -1254,6 +1373,7 @@ impl TorrentState {
             pieces,
             chunks,
             peers: Default::default(),
+            network_stats: Default::default(),
             last_tick: Instant::now(),
         }
     }
@@ -1281,11 +1401,19 @@ impl TorrentState {
             TorrentMsg::WritePieceError { key, error } => {
                 self.process_write_piece_error(key, error)
             }
+            TorrentMsg::NetworkStats { res } => {
+                let stats = self.network_stats.stats();
+                let _ = res.send(stats);
+            }
+            TorrentMsg::Completed { res } => {
+                let completed = self.bitfield.complete();
+                let _ = res.send(completed);
+            }
         }
     }
 
     pub fn process_tick(&mut self) {
-        println!("tick");
+        //println!("tick");
         self.check_peer_interests();
         self.request_chunks();
     }
@@ -1442,7 +1570,7 @@ impl TorrentState {
     }
 
     fn process_received_chunk(&mut self, peer_key: PeerKey, chunk_key: ChunkKey, data: Bytes) {
-        println!("received chunk");
+        //println!("received chunk");
 
         let peer = &mut self.peers[peer_key];
         let chunk = &mut self.chunks[chunk_key];
@@ -1450,6 +1578,7 @@ impl TorrentState {
         assert_eq!(chunk.assigned_peer, Some(peer_key));
         assert!(chunk.data.is_none());
 
+        let data_len = data.len() as u32;
         let pending_chunk_idx = peer
             .pending_chunks
             .iter()
@@ -1458,6 +1587,7 @@ impl TorrentState {
         peer.pending_chunks.swap_remove(pending_chunk_idx);
         chunk.data = Some(data);
 
+        self.network_stats.add_download(data_len);
         self.attempt_finalize_piece(piece_key);
         self.request_chunks_from(peer_key);
     }
@@ -1504,7 +1634,7 @@ impl TorrentState {
                     ),
                 );
             }
-            println!("finalized piece {piece_index}");
+            //println!("finalized piece {piece_index}");
         } else {
             for &chunk_key in piece.chunks.iter() {
                 let chunk = &mut self.chunks[chunk_key];
@@ -1559,7 +1689,7 @@ impl TorrentState {
                     continue;
                 }
 
-                println!("requesting chunk from peer");
+                //println!("requesting chunk from peer");
                 chunk.assigned_peer = Some(peer_key);
                 peer.pending_chunks.push(chunk_key);
                 peer.io.send(request_message_from_chunk(chunk));
@@ -1612,6 +1742,24 @@ impl Torrent {
         self.send(TorrentMsg::ConnectToPeer { addr });
     }
 
+    pub fn network_stats(&self) -> NetworkStats {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        self.send(TorrentMsg::NetworkStats { res: sender });
+        receiver.recv().unwrap()
+    }
+
+    pub fn completed(&self) -> bool {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        self.send(TorrentMsg::Completed { res: sender });
+        receiver.recv().unwrap()
+    }
+
+    pub fn wait_until_completed(&self) {
+        while !self.completed() {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
     fn send(&self, message: TorrentMsg) {
         self.sender
             .send(message)
@@ -1628,6 +1776,40 @@ fn torrent_entry(mut state: TorrentState) {
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
         state.process();
+    }
+}
+
+pub struct ByteDisplay(u64);
+
+impl std::fmt::Display for ByteDisplay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (n, suffix) = if self.0 > 1024 * 1024 * 1024 {
+            (self.0 as f64 / (1024.0 * 1024.0 * 1024.0), "GiB")
+        } else if self.0 > 1024 * 1024 {
+            (self.0 as f64 / (1024.0 * 1024.0), "MiB")
+        } else if self.0 > 1024 {
+            (self.0 as f64 / 1024.0, "KiB")
+        } else {
+            (self.0 as f64, "B")
+        };
+        write!(f, "{n} {suffix}")
+    }
+}
+
+pub struct ByteRateDisplay(u64);
+
+impl std::fmt::Display for ByteRateDisplay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (n, suffix) = if self.0 > 1024 * 1024 * 1024 {
+            (self.0 as f64 / (1024.0 * 1024.0 * 1024.0), "GiB/s")
+        } else if self.0 > 1024 * 1024 {
+            (self.0 as f64 / (1024.0 * 1024.0), "MiB/s")
+        } else if self.0 > 1024 {
+            (self.0 as f64 / 1024.0, "KiB/s")
+        } else {
+            (self.0 as f64, "B/s")
+        };
+        write!(f, "{n} {suffix}")
     }
 }
 
@@ -1655,7 +1837,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let torrent = Torrent::new(metainfo);
     torrent.connect_to_peer("127.0.0.1:51413".parse()?);
-    std::thread::sleep(Duration::from_secs(30));
+    while !torrent.completed() {
+        let stats = torrent.network_stats();
+        println!(
+            "Download: {}\tUpload: {}\t - {}",
+            ByteRateDisplay(u64::from(stats.download_rate)),
+            ByteRateDisplay(u64::from(stats.upload_rate)),
+            ByteDisplay(u64::from(stats.download))
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    }
     Ok(())
 }
 
