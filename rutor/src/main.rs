@@ -865,93 +865,6 @@ impl PieceKey {
     }
 }
 
-#[derive(Debug, Clone)]
-struct PieceDesc {
-    key: PieceKey,
-    index: u32,
-    hash: Sha1,
-    length: u32,
-    ranges: Vec<PieceFileRange>,
-}
-
-#[derive(Debug, Clone)]
-struct FileDesc {
-    key: FileKey,
-    path: String,
-    length: u64,
-}
-
-struct PieceIdxMap {
-    ids: Vec<PieceKey>,
-}
-
-impl PieceIdxMap {
-    fn new(ids: Vec<PieceKey>) -> Self {
-        Self { ids }
-    }
-
-    fn get(&self, piece_idx: u32) -> Option<PieceKey> {
-        self.ids.get(piece_idx as usize).copied()
-    }
-}
-
-struct TorrentDesc {
-    meta: Metainfo,
-    pieces: SlotMap<PieceKey, PieceDesc>,
-    pieces_map: PieceIdxMap,
-    files: SlotMap<FileKey, FileDesc>,
-}
-
-impl TorrentDesc {
-    fn new(metainfo: Metainfo) -> Self {
-        let mut pieces = SlotMap::<PieceKey, PieceDesc>::default();
-        let mut files = SlotMap::<FileKey, FileDesc>::default();
-        for file in &metainfo.info.files {
-            files.insert_with_key(|id| FileDesc {
-                key: id,
-                path: file.path.clone(),
-                length: file.length,
-            });
-        }
-
-        let mut file_offset = 0;
-        let mut remain = metainfo.info.length;
-        let mut piece_ids = Vec::with_capacity(metainfo.info.pieces.len());
-        for (piece_idx, piece_hash) in metainfo.info.pieces.iter().enumerate() {
-            let length = remain.min(metainfo.info.piece_length);
-            remain = remain.saturating_sub(length);
-            let length = length as u32;
-
-            let mut ranges = Vec::new();
-            for file in files.values() {
-                // ranges.push(PieceFileRange {
-                //     file: file.key,
-                //     file_offset,
-                //     length,
-                // });
-            }
-
-            let piece_id = pieces.insert_with_key(move |id| PieceDesc {
-                key: id,
-                index: piece_idx as u32,
-                hash: *piece_hash,
-                length,
-                ranges,
-            });
-            piece_ids.push(piece_id);
-
-            file_offset += u64::from(length);
-        }
-
-        Self {
-            meta: metainfo,
-            pieces,
-            pieces_map: PieceIdxMap::new(piece_ids),
-            files,
-        }
-    }
-}
-
 const CHUNK_LENGTH: u32 = 16 * 1024;
 const MAX_PEER_PENDING_CHUNKS: usize = 8;
 
@@ -1546,6 +1459,7 @@ impl TorrentState {
         chunk.data = Some(data);
 
         self.attempt_finalize_piece(piece_key);
+        self.request_chunks_from(peer_key);
     }
 
     fn process_write_piece_error(&mut self, piece_key: PieceKey, error: std::io::Error) {
@@ -1625,26 +1539,30 @@ impl TorrentState {
         }
 
         for peer_key in candidate_peers {
-            let peer = &mut self.peers[peer_key];
-            let mut missing_iter = peer.bitfield.iter_missing_in(&self.bitfield);
-            while peer.pending_chunks.len() < MAX_PEER_PENDING_CHUNKS {
-                let piece_idx = match missing_iter.next() {
-                    Some(idx) => idx,
-                    None => break,
-                };
-                let piece_key = PieceKey::from_index(piece_idx);
-                let piece = &self.pieces[piece_key];
-                for &chunk_key in piece.chunks.iter() {
-                    let chunk = &mut self.chunks[chunk_key];
-                    if chunk.assigned_peer.is_some() {
-                        continue;
-                    }
+            self.request_chunks_from(peer_key);
+        }
+    }
 
-                    println!("requesting chunk from peer");
-                    chunk.assigned_peer = Some(peer_key);
-                    peer.pending_chunks.push(chunk_key);
-                    peer.io.send(request_message_from_chunk(chunk));
+    fn request_chunks_from(&mut self, peer_key: PeerKey) {
+        let peer = &mut self.peers[peer_key];
+        let mut missing_iter = peer.bitfield.iter_missing_in(&self.bitfield);
+        while peer.pending_chunks.len() < MAX_PEER_PENDING_CHUNKS {
+            let piece_idx = match missing_iter.next() {
+                Some(idx) => idx,
+                None => break,
+            };
+            let piece_key = PieceKey::from_index(piece_idx);
+            let piece = &self.pieces[piece_key];
+            for &chunk_key in piece.chunks.iter() {
+                let chunk = &mut self.chunks[chunk_key];
+                if chunk.assigned_peer.is_some() {
+                    continue;
                 }
+
+                println!("requesting chunk from peer");
+                chunk.assigned_peer = Some(peer_key);
+                peer.pending_chunks.push(chunk_key);
+                peer.io.send(request_message_from_chunk(chunk));
             }
         }
     }
@@ -1739,88 +1657,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     torrent.connect_to_peer("127.0.0.1:51413".parse()?);
     std::thread::sleep(Duration::from_secs(30));
     Ok(())
-    // let torrent_state = TorrentState::from_metainfo(metainfo.clone());
-    // println!("{torrent_state:#?}");
-    //
-    // let peer_id = PeerId::default();
-    // //let mut stream = TcpStream::connect("127.0.0.1:51413").unwrap();
-    // let mut stream = TcpStream::connect("10.0.3.3:6881").unwrap();
-    // write_handshake(
-    //     &mut stream,
-    //     &Handshake {
-    //         info_hash: metainfo.info_hash,
-    //         peer_id: Default::default(),
-    //     },
-    // )
-    // .unwrap();
-    // let handshake = read_handshake(&mut stream).unwrap();
-    // println!("{:#?}", handshake);
-    //
-    // // write_message(
-    // //     &mut stream,
-    // //     &Message::Bitfield {
-    // //         bitfield: Default::default(),
-    // //     },
-    // // )?;
-    //
-    // let bitfield = match read_message(&mut stream).unwrap() {
-    //     Message::Bitfield { bitfield } => Bitfield::new(bitfield, metainfo.info.pieces.len()),
-    //     _ => panic!("expected first message to be bitfield"),
-    // };
-    // println!("{:#?}", bitfield);
-    //
-    // let mut chocked = true;
-    // let mut state = TorrentDesc::new(metainfo.clone());
-    // let mut next_piece_idx = 0;
-    // let mut pending_piece = false;
-    //
-    // write_message(&mut stream, &Message::Interested)?;
-    // write_message(&mut stream, &Message::Unchoke)?;
-    //
-    // loop {
-    //     let message = read_message(&mut stream)?;
-    //     println!("{message:#?}");
-    //     match message {
-    //         Message::Choke => chocked = true,
-    //         Message::Unchoke => chocked = false,
-    //         Message::Bitfield { .. } => panic!("received bitfield twice"),
-    //         Message::Piece { index, begin, data } => println!("received piece"),
-    //         _ => {}
-    //     }
-    //
-    //     if !chocked && !pending_piece {
-    //         let piece_idx = next_piece_idx;
-    //         let piece_id = match state.pieces_map.get(piece_idx) {
-    //             Some(id) => id,
-    //             None => break,
-    //         };
-    //
-    //         let piece_desc = &mut state.pieces[piece_id];
-    //         let piece_len = piece_desc.length;
-    //
-    //         println!("sending piece request");
-    //         write_message(
-    //             &mut stream,
-    //             &Message::Request {
-    //                 index: piece_idx,
-    //                 begin: 0,
-    //                 length: 16 * 1024,
-    //             },
-    //         )?;
-    //         pending_piece = true;
-    //     }
-    //
-    //     // for idx in 0..metainfo.info.pieces.len() {
-    //     //     let piece_idx = idx as u32;
-    //     //     let request_message = Message::Request {
-    //     //         index: piece_idx,
-    //     //         begin: 0,
-    //     //         length: 0,
-    //     //     };
-    //     // }
-    // }
-    //
-    // Ok(())
 }
 
 fn list_tracker_peers() {
