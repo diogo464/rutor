@@ -1,8 +1,10 @@
 use std::{
-    io::{Read, Write},
-    net::{Ipv4Addr, SocketAddrV4, TcpStream, UdpSocket},
+    collections::VecDeque,
+    io::{BufReader, BufWriter, Read, Write},
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream, UdpSocket},
     path::PathBuf,
     sync::Arc,
+    time::Duration,
 };
 
 use serde::Serialize;
@@ -948,8 +950,145 @@ impl TorrentDesc {
 
 const CHUNK_LENGTH: u32 = 16 * 1024;
 
+type Sender<T> = std::sync::mpsc::Sender<T>;
+type Receiver<T> = std::sync::mpsc::Receiver<T>;
+type TorrentSender = std::sync::mpsc::Sender<TorrentMsg>;
+type TorrentReceiver = std::sync::mpsc::Receiver<TorrentMsg>;
+
 #[derive(Debug)]
-struct PeerIO {}
+struct PeerIO {
+    sender: Sender<Message>,
+}
+
+impl PeerIO {
+    pub fn connect(
+        key: PeerKey,
+        torrent_sender: TorrentSender,
+        addr: SocketAddr,
+        peer_id: PeerId,
+        info_hash: Sha1,
+    ) -> PeerIO {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            peer_io_connect(key, receiver, torrent_sender, addr, peer_id, info_hash)
+        });
+        Self { sender }
+    }
+
+    pub fn send(&self, message: Message) {
+        // TODO: log result if it is error
+        // we probably don't care if this fails since that means the threads are exiting and a peer
+        // failure message has already been queued. It should never be the case that this fails but
+        // a failure message is not queued.
+        let _ = self.sender.send(message);
+    }
+}
+
+fn peer_io_connect(
+    key: PeerKey,
+    receiver: Receiver<Message>,
+    sender: TorrentSender,
+    addr: SocketAddr,
+    peer_id: PeerId,
+    info_hash: Sha1,
+) {
+    fn try_connect(
+        addr: SocketAddr,
+        peer_id: PeerId,
+        info_hash: Sha1,
+    ) -> std::io::Result<(TcpStream, Handshake)> {
+        let mut stream = TcpStream::connect(addr)?;
+        stream.set_write_timeout(Some(Duration::from_secs(8)))?;
+        write_handshake(&mut stream, &Handshake { info_hash, peer_id })?;
+        let handshake = read_handshake(&mut stream)?;
+        Ok((stream, handshake))
+    }
+
+    let (stream, handshake) = match try_connect(addr, peer_id, info_hash) {
+        Ok((stream, handshake)) => (stream, handshake),
+        Err(error) => {
+            let _ = sender.send(TorrentMsg::PeerError { key, error });
+            return;
+        }
+    };
+
+    let send_result = sender.send(TorrentMsg::PeerHandshake {
+        key,
+        id: handshake.peer_id,
+        info_hash: handshake.info_hash,
+    });
+    if send_result.is_err() {
+        return;
+    }
+
+    let stream = Arc::new(stream);
+    std::thread::spawn({
+        let stream = stream.clone();
+        let sender = sender.clone();
+        move || peer_io_writer(key, receiver, sender, stream)
+    });
+    peer_io_reader(key, sender, stream);
+}
+
+fn peer_io_reader(key: PeerKey, sender: TorrentSender, tcp_stream: Arc<TcpStream>) {
+    let mut stream = BufReader::new(&*tcp_stream);
+    loop {
+        match read_message(&mut stream) {
+            Ok(message) => {
+                if sender
+                    .send(TorrentMsg::PeerMessage { key, message })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Err(error) => {
+                let _ = sender.send(TorrentMsg::PeerError { key, error });
+                break;
+            }
+        }
+    }
+
+    let _ = tcp_stream.shutdown(std::net::Shutdown::Both);
+}
+
+fn peer_io_writer(
+    key: PeerKey,
+    receiver: Receiver<Message>,
+    sender: TorrentSender,
+    tcp_stream: Arc<TcpStream>,
+) {
+    let mut stream = BufWriter::new(&*tcp_stream);
+    while let Ok(message) = receiver.recv() {
+        let result = write_message(&mut stream, &message).and_then(|_| stream.flush());
+        if let Err(error) = result {
+            let _ = sender.send(TorrentMsg::PeerError { key, error });
+            break;
+        }
+    }
+
+    let _ = tcp_stream.shutdown(std::net::Shutdown::Both);
+}
+
+#[derive(Debug)]
+enum TorrentMsg {
+    PeerHandshake {
+        key: PeerKey,
+        id: PeerId,
+        info_hash: Sha1,
+    },
+    PeerMessage {
+        key: PeerKey,
+        message: Message,
+    },
+    PeerError {
+        key: PeerKey,
+        error: std::io::Error,
+    },
+    ConnectToPeer {
+        addr: SocketAddr,
+    },
+}
 
 #[derive(Debug)]
 struct FileState {
@@ -978,6 +1117,7 @@ struct ChunkState {
 struct PeerState {
     id: PeerId,
     io: PeerIO,
+    addr: SocketAddr,
     /// have we received the bitfield from the remote peer?
     /// if the first message is not the bitfield, then it is implied that it is empty
     bitfield_received: bool,
@@ -996,6 +1136,7 @@ struct PeerState {
 #[derive(Debug)]
 struct TorrentState {
     info: ArcMetaInfo,
+    queue: VecDeque<TorrentMsg>,
     files: SlotMap<FileKey, FileState>,
     pieces: SecondaryMap<PieceKey, PieceState>,
     chunks: SlotMap<ChunkKey, ChunkState>,
@@ -1082,99 +1223,156 @@ impl TorrentState {
 
         Self {
             info: Arc::new(info),
+            queue: Default::default(),
             files,
             pieces,
             chunks,
             peers: Default::default(),
         }
     }
+
+    pub fn queue_message(&mut self, message: TorrentMsg) {
+        self.queue.push_back(message);
+    }
+
+    pub fn process_messages(&mut self) {
+        while let Some(message) = self.queue.pop_front() {
+            self.process_message(message);
+        }
+    }
+
+    pub fn process_message(&mut self, message: TorrentMsg) {
+        match message {
+            TorrentMsg::PeerHandshake { key, id, info_hash } => todo!(),
+            TorrentMsg::PeerMessage { key, message } => todo!(),
+            TorrentMsg::PeerError { key, error } => todo!(),
+            TorrentMsg::ConnectToPeer { addr } => {
+                println!("received request to connect to peer at {addr}");
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct Torrent {
+    sender: TorrentSender,
+}
+
+impl Torrent {
+    pub fn new(metainfo: Metainfo) -> Self {
+        let state = TorrentState::from_metainfo(metainfo);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || torrent_entry(state, receiver));
+        Self { sender }
+    }
+
+    pub fn connect_to_peer(&self, addr: SocketAddr) {
+        self.send(TorrentMsg::ConnectToPeer { addr });
+    }
+
+    fn send(&self, message: TorrentMsg) {
+        self.sender
+            .send(message)
+            .expect("torrent loop should never exit while sender is alive")
+    }
+}
+
+fn torrent_entry(mut state: TorrentState, receiver: TorrentReceiver) {
+    while let Ok(msg) = receiver.recv() {
+        state.queue_message(msg);
+        state.process_messages();
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let content = std::fs::read("bunny.torrent").unwrap();
     let metainfo = bencode::decode::<Metainfo>(&content).unwrap();
-    let torrent_state = TorrentState::from_metainfo(metainfo.clone());
-    println!("{torrent_state:#?}");
-
-    let peer_id = PeerId::default();
-    //let mut stream = TcpStream::connect("127.0.0.1:51413").unwrap();
-    let mut stream = TcpStream::connect("10.0.3.3:6881").unwrap();
-    write_handshake(
-        &mut stream,
-        &Handshake {
-            info_hash: metainfo.info_hash,
-            peer_id: Default::default(),
-        },
-    )
-    .unwrap();
-    let handshake = read_handshake(&mut stream).unwrap();
-    println!("{:#?}", handshake);
-
-    // write_message(
-    //     &mut stream,
-    //     &Message::Bitfield {
-    //         bitfield: Default::default(),
-    //     },
-    // )?;
-
-    let bitfield = match read_message(&mut stream).unwrap() {
-        Message::Bitfield { bitfield } => Bitfield::new(bitfield, metainfo.info.pieces.len()),
-        _ => panic!("expected first message to be bitfield"),
-    };
-    println!("{:#?}", bitfield);
-
-    let mut chocked = true;
-    let mut state = TorrentDesc::new(metainfo.clone());
-    let mut next_piece_idx = 0;
-    let mut pending_piece = false;
-
-    write_message(&mut stream, &Message::Interested)?;
-    write_message(&mut stream, &Message::Unchoke)?;
-
-    loop {
-        let message = read_message(&mut stream)?;
-        println!("{message:#?}");
-        match message {
-            Message::Choke => chocked = true,
-            Message::Unchoke => chocked = false,
-            Message::Bitfield { .. } => panic!("received bitfield twice"),
-            Message::Piece { index, begin, data } => println!("received piece"),
-            _ => {}
-        }
-
-        if !chocked && !pending_piece {
-            let piece_idx = next_piece_idx;
-            let piece_id = match state.pieces_map.get(piece_idx) {
-                Some(id) => id,
-                None => break,
-            };
-
-            let piece_desc = &mut state.pieces[piece_id];
-            let piece_len = piece_desc.length;
-
-            println!("sending piece request");
-            write_message(
-                &mut stream,
-                &Message::Request {
-                    index: piece_idx,
-                    begin: 0,
-                    length: 16 * 1024,
-                },
-            )?;
-            pending_piece = true;
-        }
-
-        // for idx in 0..metainfo.info.pieces.len() {
-        //     let piece_idx = idx as u32;
-        //     let request_message = Message::Request {
-        //         index: piece_idx,
-        //         begin: 0,
-        //         length: 0,
-        //     };
-        // }
-    }
-
+    let torrent = Torrent::new(metainfo);
+    torrent.connect_to_peer("10.0.3.3:6881".parse()?);
+    std::thread::sleep(Duration::from_secs(10));
     Ok(())
+    // let torrent_state = TorrentState::from_metainfo(metainfo.clone());
+    // println!("{torrent_state:#?}");
+    //
+    // let peer_id = PeerId::default();
+    // //let mut stream = TcpStream::connect("127.0.0.1:51413").unwrap();
+    // let mut stream = TcpStream::connect("10.0.3.3:6881").unwrap();
+    // write_handshake(
+    //     &mut stream,
+    //     &Handshake {
+    //         info_hash: metainfo.info_hash,
+    //         peer_id: Default::default(),
+    //     },
+    // )
+    // .unwrap();
+    // let handshake = read_handshake(&mut stream).unwrap();
+    // println!("{:#?}", handshake);
+    //
+    // // write_message(
+    // //     &mut stream,
+    // //     &Message::Bitfield {
+    // //         bitfield: Default::default(),
+    // //     },
+    // // )?;
+    //
+    // let bitfield = match read_message(&mut stream).unwrap() {
+    //     Message::Bitfield { bitfield } => Bitfield::new(bitfield, metainfo.info.pieces.len()),
+    //     _ => panic!("expected first message to be bitfield"),
+    // };
+    // println!("{:#?}", bitfield);
+    //
+    // let mut chocked = true;
+    // let mut state = TorrentDesc::new(metainfo.clone());
+    // let mut next_piece_idx = 0;
+    // let mut pending_piece = false;
+    //
+    // write_message(&mut stream, &Message::Interested)?;
+    // write_message(&mut stream, &Message::Unchoke)?;
+    //
+    // loop {
+    //     let message = read_message(&mut stream)?;
+    //     println!("{message:#?}");
+    //     match message {
+    //         Message::Choke => chocked = true,
+    //         Message::Unchoke => chocked = false,
+    //         Message::Bitfield { .. } => panic!("received bitfield twice"),
+    //         Message::Piece { index, begin, data } => println!("received piece"),
+    //         _ => {}
+    //     }
+    //
+    //     if !chocked && !pending_piece {
+    //         let piece_idx = next_piece_idx;
+    //         let piece_id = match state.pieces_map.get(piece_idx) {
+    //             Some(id) => id,
+    //             None => break,
+    //         };
+    //
+    //         let piece_desc = &mut state.pieces[piece_id];
+    //         let piece_len = piece_desc.length;
+    //
+    //         println!("sending piece request");
+    //         write_message(
+    //             &mut stream,
+    //             &Message::Request {
+    //                 index: piece_idx,
+    //                 begin: 0,
+    //                 length: 16 * 1024,
+    //             },
+    //         )?;
+    //         pending_piece = true;
+    //     }
+    //
+    //     // for idx in 0..metainfo.info.pieces.len() {
+    //     //     let piece_idx = idx as u32;
+    //     //     let request_message = Message::Request {
+    //     //         index: piece_idx,
+    //     //         begin: 0,
+    //     //         length: 0,
+    //     //     };
+    //     // }
+    // }
+    //
+    // Ok(())
 }
 
 fn list_tracker_peers() {
