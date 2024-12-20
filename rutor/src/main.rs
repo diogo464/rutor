@@ -4,7 +4,7 @@ use std::{
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream, UdpSocket},
     path::PathBuf,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use serde::Serialize;
@@ -642,9 +642,17 @@ impl Buffer {
         v.extend_from_slice(buf);
         Self(Arc::from(v.into_boxed_slice()))
     }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
 }
 
-#[derive(Clone)]
+#[derive(Default, Clone)]
 pub struct Bitfield {
     data: Vec<u8>,
     bits: usize,
@@ -661,6 +669,42 @@ impl Bitfield {
         let vec_len = (bits + 7) / 8;
         data.resize(vec_len, 0);
         Self { data, bits }
+    }
+
+    fn empty(bits: usize) -> Self {
+        Self::new(Default::default(), bits)
+    }
+
+    fn set(&mut self, index: u32) {
+        let index = index as usize;
+        assert!(index < self.bits);
+        let byte_index = index / 8;
+        self.data[byte_index] |= 1 << (index % 8);
+    }
+
+    fn test(&self, index: u32) -> bool {
+        let index = index as usize;
+        assert!(index < self.bits);
+        let byte_index = index / 8;
+        (self.data[byte_index] & 1 << (index % 8)) != 0
+    }
+
+    fn contains_missing_in(&self, other: &Self) -> bool {
+        assert_eq!(self.bits, other.bits);
+        for (&lhs, &rhs) in self.data.iter().zip(other.data.iter()) {
+            if lhs & !rhs != 0 {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn iter_missing_in<'s>(&'s self, other: &'s Self) -> impl Iterator<Item = u32> + 's {
+        // TODO: improve function
+        (0..self.bits)
+            .map(|idx| (idx as u32, self.test(idx as u32), other.test(idx as u32)))
+            .filter(|(_, lhs, rhs)| *lhs && !*rhs)
+            .map(|(idx, _, _)| idx)
     }
 }
 
@@ -949,6 +993,7 @@ impl TorrentDesc {
 }
 
 const CHUNK_LENGTH: u32 = 16 * 1024;
+const MAX_PEER_PENDING_CHUNKS: usize = 8;
 
 type Sender<T> = std::sync::mpsc::Sender<T>;
 type Receiver<T> = std::sync::mpsc::Receiver<T>;
@@ -996,15 +1041,18 @@ fn peer_io_connect(
         addr: SocketAddr,
         peer_id: PeerId,
         info_hash: Sha1,
-    ) -> std::io::Result<(TcpStream, Handshake)> {
+    ) -> std::io::Result<(TcpStream, PeerId)> {
         let mut stream = TcpStream::connect(addr)?;
         stream.set_write_timeout(Some(Duration::from_secs(8)))?;
         write_handshake(&mut stream, &Handshake { info_hash, peer_id })?;
         let handshake = read_handshake(&mut stream)?;
-        Ok((stream, handshake))
+        if handshake.info_hash != info_hash {
+            return Err(std::io::Error::other("handshake info hash missmatch"));
+        }
+        Ok((stream, handshake.peer_id))
     }
 
-    let (stream, handshake) = match try_connect(addr, peer_id, info_hash) {
+    let (stream, remote_peer_id) = match try_connect(addr, peer_id, info_hash) {
         Ok((stream, handshake)) => (stream, handshake),
         Err(error) => {
             let _ = sender.send(TorrentMsg::PeerError { key, error });
@@ -1014,8 +1062,7 @@ fn peer_io_connect(
 
     let send_result = sender.send(TorrentMsg::PeerHandshake {
         key,
-        id: handshake.peer_id,
-        info_hash: handshake.info_hash,
+        id: remote_peer_id,
     });
     if send_result.is_err() {
         return;
@@ -1072,22 +1119,10 @@ fn peer_io_writer(
 
 #[derive(Debug)]
 enum TorrentMsg {
-    PeerHandshake {
-        key: PeerKey,
-        id: PeerId,
-        info_hash: Sha1,
-    },
-    PeerMessage {
-        key: PeerKey,
-        message: Message,
-    },
-    PeerError {
-        key: PeerKey,
-        error: std::io::Error,
-    },
-    ConnectToPeer {
-        addr: SocketAddr,
-    },
+    PeerHandshake { key: PeerKey, id: PeerId },
+    PeerMessage { key: PeerKey, message: Message },
+    PeerError { key: PeerKey, error: std::io::Error },
+    ConnectToPeer { addr: SocketAddr },
 }
 
 #[derive(Debug)]
@@ -1111,6 +1146,7 @@ struct ChunkState {
     offset: u32,
     length: u32,
     assigned_peer: Option<PeerKey>,
+    data: Option<Buffer>,
 }
 
 #[derive(Debug)]
@@ -1118,29 +1154,35 @@ struct PeerState {
     id: PeerId,
     io: PeerIO,
     addr: SocketAddr,
+    handshake_received: bool,
     /// have we received the bitfield from the remote peer?
     /// if the first message is not the bitfield, then it is implied that it is empty
     bitfield_received: bool,
     bitfield: Bitfield,
     /// are we chocked by the peer
-    local_choke: bool,
-    /// are we choking the peer
     remote_choke: bool,
+    /// are we choking the peer
+    local_choke: bool,
     /// is the peer interested in us
-    local_interested: bool,
-    /// are we interested in the peer
     remote_interested: bool,
+    /// are we interested in the peer
+    local_interested: bool,
     pending_chunks: Vec<ChunkKey>,
 }
 
 #[derive(Debug)]
 struct TorrentState {
+    id: PeerId,
     info: ArcMetaInfo,
+    sender: TorrentSender,
+    receiver: TorrentReceiver,
     queue: VecDeque<TorrentMsg>,
+    bitfield: Bitfield,
     files: SlotMap<FileKey, FileState>,
     pieces: SecondaryMap<PieceKey, PieceState>,
     chunks: SlotMap<ChunkKey, ChunkState>,
     peers: SlotMap<PeerKey, PeerState>,
+    last_tick: Instant,
 }
 
 impl TorrentState {
@@ -1210,6 +1252,7 @@ impl TorrentState {
                         offset: CHUNK_LENGTH * i,
                         length: rem_piece_length.min(CHUNK_LENGTH),
                         assigned_peer: Default::default(),
+                        data: Default::default(),
                     });
                     rem_piece_length = rem_piece_length.saturating_sub(CHUNK_LENGTH);
                     piece_chunks.push(chunk_key);
@@ -1221,13 +1264,20 @@ impl TorrentState {
             pieces[piece_key].ranges = piece_ranges;
         }
 
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let bitfield = Bitfield::empty(info.info.pieces.len());
         Self {
+            id: Default::default(),
             info: Arc::new(info),
+            sender,
+            receiver,
             queue: Default::default(),
+            bitfield,
             files,
             pieces,
             chunks,
             peers: Default::default(),
+            last_tick: Instant::now(),
         }
     }
 
@@ -1235,21 +1285,311 @@ impl TorrentState {
         self.queue.push_back(message);
     }
 
-    pub fn process_messages(&mut self) {
+    pub fn process(&mut self) {
         while let Some(message) = self.queue.pop_front() {
             self.process_message(message);
+        }
+        if self.last_tick.elapsed() > Duration::from_secs(1) {
+            self.last_tick = Instant::now();
+            self.process_tick();
         }
     }
 
     pub fn process_message(&mut self, message: TorrentMsg) {
         match message {
-            TorrentMsg::PeerHandshake { key, id, info_hash } => todo!(),
-            TorrentMsg::PeerMessage { key, message } => todo!(),
-            TorrentMsg::PeerError { key, error } => todo!(),
-            TorrentMsg::ConnectToPeer { addr } => {
-                println!("received request to connect to peer at {addr}");
+            TorrentMsg::PeerHandshake { key, id } => self.process_peer_handshake(key, id),
+            TorrentMsg::PeerMessage { key, message } => self.process_peer_message(key, message),
+            TorrentMsg::PeerError { key, error } => self.process_peer_error(key, error),
+            TorrentMsg::ConnectToPeer { addr } => self.process_connect_to_peer(addr),
+        }
+    }
+
+    pub fn process_tick(&mut self) {
+        println!("tick");
+        self.check_peer_interests();
+        self.request_chunks();
+    }
+
+    fn process_peer_handshake(&mut self, key: PeerKey, id: PeerId) {
+        let peer = match self.peers.get_mut(key) {
+            Some(peer) => peer,
+            None => return,
+        };
+
+        if peer.handshake_received {
+            self.disconnect_peer(key);
+            return;
+        }
+
+        println!("received handshake");
+        peer.handshake_received = true;
+        peer.id = id;
+    }
+
+    fn process_peer_message(&mut self, key: PeerKey, message: Message) {
+        let peer = match self.peers.get_mut(key) {
+            Some(peer) => peer,
+            None => return,
+        };
+
+        if !peer.handshake_received {
+            println!("received peer message before handshake");
+            self.disconnect_peer(key);
+            return;
+        }
+
+        if let Message::Bitfield { bitfield } = message {
+            println!("received bitfield");
+            if peer.bitfield_received {
+                println!("received duplicate peer bitfield");
+                self.disconnect_peer(key);
+                return;
+            }
+            peer.bitfield_received = true;
+            peer.bitfield = Bitfield::new(bitfield, self.info.info.pieces.len());
+        } else {
+            if !peer.bitfield_received {
+                println!("received peer message before bitfield, assuming empty bitfield");
+                peer.bitfield_received = true;
+                peer.bitfield = Bitfield::new(Default::default(), self.info.info.pieces.len());
+            }
+
+            match message {
+                Message::Choke => {
+                    println!("peer choked");
+                    peer.remote_choke = true
+                }
+                Message::Unchoke => {
+                    println!("peer unchoked");
+                    peer.remote_choke = false
+                }
+                Message::Interested => {
+                    println!("peer interested");
+                    peer.remote_interested = true
+                }
+                Message::NotInterested => {
+                    println!("peer not interested");
+                    peer.remote_interested = false
+                }
+                Message::Have { index } => {
+                    let piece_key = PieceKey::from_index(index);
+                    if !self.pieces.contains_key(piece_key) {
+                        println!("peer sent Have message with invalid piece index");
+                        self.disconnect_peer(key);
+                        return;
+                    }
+                    peer.bitfield.set(index);
+                }
+                Message::Bitfield { .. } => unreachable!(),
+                Message::Request {
+                    index,
+                    begin,
+                    length,
+                } => todo!(),
+                Message::Piece { index, begin, data } => {
+                    let piece_key = PieceKey::from_index(index);
+                    if !self.pieces.contains_key(piece_key) {
+                        println!("peer sent Piece message with invalid piece index");
+                        self.disconnect_peer(key);
+                        return;
+                    }
+
+                    let mut ckey = None;
+                    for &chunk_key in peer.pending_chunks.iter() {
+                        let chunk = &self.chunks[chunk_key];
+                        if chunk.piece == piece_key
+                            && chunk.offset == begin
+                            && chunk.length as usize == data.len()
+                        {
+                            ckey = Some(chunk_key);
+                            break;
+                        }
+                    }
+
+                    match ckey {
+                        Some(chunk_key) => {
+                            self.process_received_chunk(key, chunk_key, data);
+                        }
+                        None => {
+                            println!("received unrequest piece from peer");
+                            // NOTE: don't disconnect here since we might have sent a Cancel
+                            // message that the peer did not receive before sending us the piece.
+                            return;
+                        }
+                    }
+                }
+                Message::Cancel {
+                    index,
+                    begin,
+                    length,
+                } => todo!(),
             }
         }
+    }
+
+    fn process_peer_error(&mut self, key: PeerKey, error: std::io::Error) {
+        let addr = match self.peers.get(key) {
+            Some(peer) => peer.addr,
+            None => return,
+        };
+        println!("peer {addr} failed: {error}");
+        self.disconnect_peer(key);
+    }
+
+    fn process_connect_to_peer(&mut self, addr: SocketAddr) {
+        println!("received request to connect to peer at {addr}");
+        if self.peer_with_addr_exists(addr) {
+            println!("peer with addr {addr} already exists, no connecting");
+        }
+
+        self.peers.insert_with_key(|key| {
+            let peer_io =
+                PeerIO::connect(key, self.sender.clone(), addr, self.id, self.info.info_hash);
+            PeerState {
+                id: Default::default(),
+                io: peer_io,
+                addr,
+                handshake_received: false,
+                bitfield_received: false,
+                bitfield: Default::default(),
+                remote_choke: true,
+                local_choke: true,
+                remote_interested: false,
+                local_interested: false,
+                pending_chunks: Default::default(),
+            }
+        });
+    }
+
+    fn process_received_chunk(&mut self, peer_key: PeerKey, chunk_key: ChunkKey, data: Buffer) {
+        println!("received chunk");
+
+        let peer = &mut self.peers[peer_key];
+        let chunk = &mut self.chunks[chunk_key];
+        let piece_key = chunk.piece;
+        assert_eq!(chunk.assigned_peer, Some(peer_key));
+        assert!(chunk.data.is_none());
+
+        let pending_chunk_idx = peer
+            .pending_chunks
+            .iter()
+            .position(|&k| k == chunk_key)
+            .expect("peer should have pending chunk");
+        peer.pending_chunks.swap_remove(pending_chunk_idx);
+        chunk.data = Some(data);
+
+        self.attempt_finalize_piece(piece_key);
+    }
+
+    fn attempt_finalize_piece(&mut self, piece_key: PieceKey) {
+        let piece = &self.pieces[piece_key];
+        let complete = piece
+            .chunks
+            .iter()
+            .all(|&key| self.chunks[key].data.is_some());
+
+        if !complete {
+            return;
+        }
+
+        let mut data = Vec::with_capacity(piece.length as usize);
+        for &chunk_key in piece.chunks.iter() {
+            let chunk = &mut self.chunks[chunk_key];
+            let chunk_data = chunk.data.take().unwrap(); // Safety: we know it is present from
+                                                         // above
+            data.extend_from_slice(chunk_data.as_bytes());
+        }
+
+        // TODO: move this off thread, it is a bottleneck.
+        let hash = Sha1::hash(&data);
+        if hash == piece.hash {
+            let piece_index = piece_key.to_index();
+            self.bitfield.set(piece_index);
+            // TODO: write to disk
+            println!("finalized piece {piece_index}");
+        } else {
+            for &chunk_key in piece.chunks.iter() {
+                let chunk = &mut self.chunks[chunk_key];
+                chunk.assigned_peer = None;
+                chunk.data = None;
+            }
+        }
+    }
+
+    fn check_peer_interests(&mut self) {
+        for (_peer_key, peer) in self.peers.iter_mut() {
+            let target_interest = peer.bitfield.contains_missing_in(&self.bitfield);
+            let current_interest = peer.local_interested;
+            if target_interest != current_interest {
+                println!("updating interest {current_interest} -> {target_interest}");
+                peer.local_interested = target_interest;
+                if target_interest {
+                    peer.io.send(Message::Interested);
+                } else {
+                    peer.io.send(Message::NotInterested);
+                }
+            }
+        }
+    }
+
+    fn request_chunks(&mut self) {
+        let mut candidate_peers = Vec::new();
+        for (peer_key, peer) in self.peers.iter() {
+            if peer.local_interested && !peer.remote_choke {
+                candidate_peers.push(peer_key);
+            }
+        }
+
+        for peer_key in candidate_peers {
+            let peer = &mut self.peers[peer_key];
+            let mut missing_iter = peer.bitfield.iter_missing_in(&self.bitfield);
+            while peer.pending_chunks.len() < MAX_PEER_PENDING_CHUNKS {
+                let piece_idx = match missing_iter.next() {
+                    Some(idx) => idx,
+                    None => break,
+                };
+                let piece_key = PieceKey::from_index(piece_idx);
+                let piece = &self.pieces[piece_key];
+                for &chunk_key in piece.chunks.iter() {
+                    let chunk = &mut self.chunks[chunk_key];
+                    if chunk.assigned_peer.is_some() {
+                        continue;
+                    }
+
+                    println!("requesting chunk from peer");
+                    chunk.assigned_peer = Some(peer_key);
+                    peer.pending_chunks.push(chunk_key);
+                    peer.io.send(request_message_from_chunk(chunk));
+                }
+            }
+        }
+    }
+
+    fn disconnect_peer(&mut self, key: PeerKey) {
+        let peer = match self.peers.remove(key) {
+            Some(peer) => peer,
+            None => return,
+        };
+        let peer_addr = peer.addr;
+        println!("disconnecting peer {peer_addr}");
+
+        for chunk_key in peer.pending_chunks {
+            let chunk = &mut self.chunks[chunk_key];
+            assert_eq!(chunk.assigned_peer, Some(key));
+            self.chunks[chunk_key].assigned_peer = None;
+        }
+    }
+
+    fn peer_with_addr_exists(&self, addr: SocketAddr) -> bool {
+        self.peers.values().any(|p| p.addr == addr)
+    }
+}
+
+fn request_message_from_chunk(chunk: &ChunkState) -> Message {
+    Message::Request {
+        index: chunk.piece.to_index(),
+        begin: chunk.offset,
+        length: chunk.length,
     }
 }
 
@@ -1261,8 +1601,8 @@ struct Torrent {
 impl Torrent {
     pub fn new(metainfo: Metainfo) -> Self {
         let state = TorrentState::from_metainfo(metainfo);
-        let (sender, receiver) = std::sync::mpsc::channel();
-        std::thread::spawn(move || torrent_entry(state, receiver));
+        let sender = state.sender.clone();
+        std::thread::spawn(move || torrent_entry(state));
         Self { sender }
     }
 
@@ -1277,10 +1617,15 @@ impl Torrent {
     }
 }
 
-fn torrent_entry(mut state: TorrentState, receiver: TorrentReceiver) {
-    while let Ok(msg) = receiver.recv() {
-        state.queue_message(msg);
-        state.process_messages();
+fn torrent_entry(mut state: TorrentState) {
+    loop {
+        let result = state.receiver.recv_timeout(Duration::from_secs(1));
+        match result {
+            Ok(msg) => state.queue_message(msg),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        state.process();
     }
 }
 
@@ -1288,8 +1633,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let content = std::fs::read("bunny.torrent").unwrap();
     let metainfo = bencode::decode::<Metainfo>(&content).unwrap();
     let torrent = Torrent::new(metainfo);
-    torrent.connect_to_peer("10.0.3.3:6881".parse()?);
-    std::thread::sleep(Duration::from_secs(10));
+    torrent.connect_to_peer("127.0.0.1:51413".parse()?);
+    std::thread::sleep(Duration::from_secs(30));
     Ok(())
     // let torrent_state = TorrentState::from_metainfo(metainfo.clone());
     // println!("{torrent_state:#?}");
