@@ -1,12 +1,12 @@
 use std::{
     io::{Read, Write},
     net::{Ipv4Addr, SocketAddrV4, TcpStream, UdpSocket},
+    path::PathBuf,
     sync::Arc,
 };
 
 use serde::Serialize;
-use sha1::digest::Output;
-use slotmap::SlotMap;
+use slotmap::{Key as _, SecondaryMap, SlotMap};
 
 #[derive(Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Sha1([u8; 20]);
@@ -55,27 +55,37 @@ impl std::fmt::Debug for PeerId {
     }
 }
 
-#[derive(Debug)]
-struct Metainfo {
-    announce: String,
-    announce_list: Vec<Vec<String>>,
-    info: Info,
-    info_hash: Sha1,
+type ArcMetaInfo = Arc<Metainfo>;
+
+#[derive(Debug, Clone)]
+pub struct Metainfo {
+    pub announce: String,
+    pub announce_list: Vec<Vec<String>>,
+    pub info: Info,
+    pub info_hash: Sha1,
 }
 
-#[derive(Debug)]
-struct InfoFile {
-    path: String,
-    length: u64,
+#[derive(Debug, Clone)]
+pub struct InfoFile {
+    pub path: String,
+    pub length: u64,
 }
 
-#[derive(Debug)]
-struct Info {
-    name: String,
-    piece_length: u64,
-    length: u64,
-    pieces: Vec<Sha1>,
-    files: Vec<InfoFile>,
+#[derive(Debug, Clone)]
+pub struct Info {
+    pub name: String,
+    pub piece_length: u64,
+    pub length: u64,
+    pub pieces: Vec<Sha1>,
+    pub files: Vec<InfoFile>,
+}
+
+impl Info {
+    pub fn piece_length(&self, index: u32) -> u32 {
+        let mut l = self.length;
+        l = l.saturating_sub(u64::from(index) * self.piece_length);
+        l.min(self.piece_length) as u32
+    }
 }
 
 impl bencode::FromValue for InfoFile {
@@ -633,19 +643,22 @@ impl Buffer {
 }
 
 #[derive(Clone)]
-struct Bitfield(Arc<[u8]>);
+pub struct Bitfield {
+    data: Vec<u8>,
+    bits: usize,
+}
 
 impl std::fmt::Debug for Bitfield {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("Bitfield").field(&self.0.len()).finish()
+        f.debug_tuple("Bitfield").field(&self.bits).finish()
     }
 }
 
 impl Bitfield {
-    fn new(buf: &[u8]) -> Self {
-        let mut v = Vec::new();
-        v.extend_from_slice(buf);
-        Self(Arc::from(v.into_boxed_slice()))
+    fn new(mut data: Vec<u8>, bits: usize) -> Self {
+        let vec_len = (bits + 7) / 8;
+        data.resize(vec_len, 0);
+        Self { data, bits }
     }
 }
 
@@ -659,7 +672,7 @@ enum Message {
         index: u32,
     },
     Bitfield {
-        bitfield: Bitfield,
+        bitfield: Vec<u8>,
     },
     Request {
         index: u32,
@@ -706,7 +719,7 @@ fn decode_message(buf: &[u8]) -> Message {
             Message::Have { index }
         }
         MessageKind::Bitfield => Message::Bitfield {
-            bitfield: Bitfield::new(&buf[1..]),
+            bitfield: buf[1..].to_owned(),
         },
         MessageKind::Request => {
             // TODO: check len == 13
@@ -754,28 +767,47 @@ fn write_u32<W: Write>(mut writer: W, value: u32) -> std::io::Result<()> {
     writer.write_all(&value.to_be_bytes())
 }
 
+fn write_message_kind<W: Write>(mut writer: W, kind: MessageKind) -> std::io::Result<()> {
+    writer.write_all(&[kind.to_u8()])
+}
+
 fn write_message<W: Write>(mut writer: W, message: &Message) -> std::io::Result<()> {
     match message {
-        Message::Choke => writer.write_all(&[0, 0, 0, 1, MessageKind::Choke.to_u8()]),
-        Message::Unchoke => writer.write_all(&[0, 0, 0, 1, MessageKind::Unchoke.to_u8()]),
-        Message::Interested => writer.write_all(&[0, 0, 0, 1, MessageKind::Interested.to_u8()]),
+        Message::Choke => {
+            write_u32(&mut writer, 1)?;
+            write_message_kind(&mut writer, MessageKind::Choke)
+        }
+        Message::Unchoke => {
+            write_u32(&mut writer, 1)?;
+            write_message_kind(&mut writer, MessageKind::Unchoke)
+        }
+        Message::Interested => {
+            write_u32(&mut writer, 1)?;
+            write_message_kind(&mut writer, MessageKind::Interested)
+        }
         Message::NotInterested => {
-            writer.write_all(&[0, 0, 0, 1, MessageKind::NotInterested.to_u8()])
+            write_u32(&mut writer, 1)?;
+            write_message_kind(&mut writer, MessageKind::NotInterested)
         }
         Message::Have { index } => {
-            write_u32(&mut writer, 4)?;
+            write_u32(&mut writer, 5)?;
+            write_message_kind(&mut writer, MessageKind::Have)?;
             write_u32(&mut writer, *index)?;
             Ok(())
         }
         Message::Bitfield { bitfield } => {
-            todo!()
+            write_u32(&mut writer, (bitfield.len() + 1) as u32)?;
+            write_message_kind(&mut writer, MessageKind::Bitfield)?;
+            writer.write_all(&bitfield)?;
+            Ok(())
         }
         Message::Request {
             index,
             begin,
             length,
         } => {
-            write_u32(&mut writer, 12)?;
+            write_u32(&mut writer, 13)?;
+            write_message_kind(&mut writer, MessageKind::Request)?;
             write_u32(&mut writer, *index)?;
             write_u32(&mut writer, *begin)?;
             write_u32(&mut writer, *length)?;
@@ -804,46 +836,73 @@ fn write_message<W: Write>(mut writer: W, message: &Message) -> std::io::Result<
 }
 
 slotmap::new_key_type! {
-    pub struct PieceId;
-    pub struct FileId;
+    pub struct PieceKey;
+    pub struct FileKey;
+    pub struct ChunkKey;
+    pub struct PeerKey;
+}
+
+impl PieceKey {
+    pub fn from_index(index: u32) -> PieceKey {
+        PieceKey::from(slotmap::KeyData::from_ffi(u64::from(index)))
+    }
+
+    pub fn to_index(&self) -> u32 {
+        (self.data().as_ffi() & 0xFFFFFFFF) as u32
+    }
 }
 
 #[derive(Debug, Clone)]
 struct FileRange {
-    id: FileId,
+    key: FileKey,
     offset: u64,
-    length: u64,
+    length: u32,
 }
 
 #[derive(Debug, Clone)]
 struct PieceDesc {
-    id: PieceId,
+    key: PieceKey,
     index: u32,
     hash: Sha1,
-    length: u64,
+    length: u32,
     ranges: Vec<FileRange>,
 }
 
 #[derive(Debug, Clone)]
 struct FileDesc {
-    id: FileId,
+    key: FileKey,
     path: String,
     length: u64,
 }
 
+struct PieceIdxMap {
+    ids: Vec<PieceKey>,
+}
+
+impl PieceIdxMap {
+    fn new(ids: Vec<PieceKey>) -> Self {
+        Self { ids }
+    }
+
+    fn get(&self, piece_idx: u32) -> Option<PieceKey> {
+        self.ids.get(piece_idx as usize).copied()
+    }
+}
+
 struct TorrentDesc {
     meta: Metainfo,
-    pieces: SlotMap<PieceId, PieceDesc>,
-    files: SlotMap<FileId, FileDesc>,
+    pieces: SlotMap<PieceKey, PieceDesc>,
+    pieces_map: PieceIdxMap,
+    files: SlotMap<FileKey, FileDesc>,
 }
 
 impl TorrentDesc {
     fn new(metainfo: Metainfo) -> Self {
-        let mut pieces = SlotMap::<PieceId, PieceDesc>::default();
-        let mut files = SlotMap::<FileId, FileDesc>::default();
+        let mut pieces = SlotMap::<PieceKey, PieceDesc>::default();
+        let mut files = SlotMap::<FileKey, FileDesc>::default();
         for file in &metainfo.info.files {
             files.insert_with_key(|id| FileDesc {
-                id,
+                key: id,
                 path: file.path.clone(),
                 length: file.length,
             });
@@ -851,34 +910,182 @@ impl TorrentDesc {
 
         let mut offset = 0;
         let mut remain = metainfo.info.length;
+        let mut piece_ids = Vec::with_capacity(metainfo.info.pieces.len());
         for (piece_idx, piece_hash) in metainfo.info.pieces.iter().enumerate() {
             let length = remain.min(metainfo.info.piece_length);
             remain = remain.saturating_sub(length);
+            let length = length as u32;
 
             let mut ranges = Vec::new();
             for file in files.values() {
                 ranges.push(FileRange {
-                    id: file.id,
+                    key: file.key,
                     offset,
                     length,
                 });
             }
 
-            pieces.insert_with_key(move |id| PieceDesc {
-                id,
+            let piece_id = pieces.insert_with_key(move |id| PieceDesc {
+                key: id,
                 index: piece_idx as u32,
                 hash: *piece_hash,
                 length,
                 ranges,
             });
+            piece_ids.push(piece_id);
 
-            offset += length;
+            offset += u64::from(length);
         }
 
         Self {
             meta: metainfo,
             pieces,
+            pieces_map: PieceIdxMap::new(piece_ids),
             files,
+        }
+    }
+}
+
+const CHUNK_LENGTH: u32 = 16 * 1024;
+
+#[derive(Debug)]
+struct PeerIO {}
+
+#[derive(Debug)]
+struct FileState {
+    path: PathBuf,
+    length: u64,
+}
+
+#[derive(Debug)]
+struct PieceState {
+    hash: Sha1,
+    length: u32,
+    chunks: Vec<ChunkKey>,
+    ranges: Vec<FileRange>,
+}
+
+#[derive(Debug)]
+struct ChunkState {
+    piece: PieceKey,
+    /// offset relative to piece
+    offset: u32,
+    length: u32,
+    assigned_peer: Option<PeerKey>,
+}
+
+#[derive(Debug)]
+struct PeerState {
+    id: PeerId,
+    io: PeerIO,
+    /// have we received the bitfield from the remote peer?
+    /// if the first message is not the bitfield, then it is implied that it is empty
+    bitfield_received: bool,
+    bitfield: Bitfield,
+    /// are we chocked by the peer
+    local_choke: bool,
+    /// are we choking the peer
+    remote_choke: bool,
+    /// is the peer interested in us
+    local_interested: bool,
+    /// are we interested in the peer
+    remote_interested: bool,
+    pending_chunks: Vec<ChunkKey>,
+}
+
+#[derive(Debug)]
+struct TorrentState {
+    info: ArcMetaInfo,
+    files: SlotMap<FileKey, FileState>,
+    pieces: SecondaryMap<PieceKey, PieceState>,
+    chunks: SlotMap<ChunkKey, ChunkState>,
+    peers: SlotMap<PeerKey, PeerState>,
+}
+
+impl TorrentState {
+    pub fn from_metainfo(info: Metainfo) -> Self {
+        let mut pieces = SecondaryMap::<PieceKey, PieceState>::default();
+        let mut chunks = SlotMap::<ChunkKey, ChunkState>::default();
+        let mut files = SlotMap::<FileKey, FileState>::default();
+        let mut file_keys = Vec::default();
+
+        for file in info.info.files.iter() {
+            let path = PathBuf::from(file.path.clone());
+            let file_key = files.insert(FileState {
+                path,
+                length: file.length,
+            });
+            file_keys.push(file_key);
+        }
+
+        for (index, &hash) in info.info.pieces.iter().enumerate() {
+            let index = index as u32;
+            let piece_key = PieceKey::from_index(index);
+            let piece_length = info.info.piece_length(index);
+            let num_chunks = (piece_length + CHUNK_LENGTH - 1) / CHUNK_LENGTH;
+            pieces.insert(
+                piece_key,
+                PieceState {
+                    hash,
+                    length: piece_length,
+                    chunks: Default::default(),
+                    ranges: Default::default(),
+                },
+            );
+            assert_eq!(piece_key.to_index(), index);
+
+            let piece_ranges = {
+                let piece_offset = u64::from(index) * info.info.piece_length;
+                let mut ranges = Vec::default();
+                let mut current_offset = 0;
+                for &file_key in file_keys.iter() {
+                    let file = &files[file_key];
+                    let file_begin = current_offset;
+                    let file_end = file_begin + file.length;
+
+                    if piece_offset >= file_begin && piece_offset < file_end {
+                        let file_offset = piece_offset - file_begin;
+                        let range_length = (file.length - file_offset).min(u64::from(piece_length));
+
+                        ranges.push(FileRange {
+                            key: file_key,
+                            offset: file_offset,
+                            length: range_length as u32,
+                        });
+                    }
+
+                    current_offset += file.length;
+                }
+
+                ranges
+            };
+
+            let piece_chunks = {
+                let mut piece_chunks = Vec::with_capacity(num_chunks as usize);
+                let mut rem_piece_length = piece_length;
+                for i in 0..num_chunks {
+                    let chunk_key = chunks.insert(ChunkState {
+                        piece: piece_key,
+                        offset: CHUNK_LENGTH * i,
+                        length: rem_piece_length.min(CHUNK_LENGTH),
+                        assigned_peer: Default::default(),
+                    });
+                    rem_piece_length = rem_piece_length.saturating_sub(CHUNK_LENGTH);
+                    piece_chunks.push(chunk_key);
+                }
+                piece_chunks
+            };
+
+            pieces[piece_key].chunks = piece_chunks;
+            pieces[piece_key].ranges = piece_ranges;
+        }
+
+        Self {
+            info: Arc::new(info),
+            files,
+            pieces,
+            chunks,
+            peers: Default::default(),
         }
     }
 }
@@ -886,7 +1093,12 @@ impl TorrentDesc {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let content = std::fs::read("bunny.torrent").unwrap();
     let metainfo = bencode::decode::<Metainfo>(&content).unwrap();
-    let mut stream = TcpStream::connect("127.0.0.1:51413").unwrap();
+    let torrent_state = TorrentState::from_metainfo(metainfo.clone());
+    println!("{torrent_state:#?}");
+
+    let peer_id = PeerId::default();
+    //let mut stream = TcpStream::connect("127.0.0.1:51413").unwrap();
+    let mut stream = TcpStream::connect("10.0.3.3:6881").unwrap();
     write_handshake(
         &mut stream,
         &Handshake {
@@ -898,21 +1110,71 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let handshake = read_handshake(&mut stream).unwrap();
     println!("{:#?}", handshake);
 
+    // write_message(
+    //     &mut stream,
+    //     &Message::Bitfield {
+    //         bitfield: Default::default(),
+    //     },
+    // )?;
+
     let bitfield = match read_message(&mut stream).unwrap() {
-        Message::Bitfield { bitfield } => bitfield,
+        Message::Bitfield { bitfield } => Bitfield::new(bitfield, metainfo.info.pieces.len()),
         _ => panic!("expected first message to be bitfield"),
     };
+    println!("{:#?}", bitfield);
+
+    let mut chocked = true;
+    let mut state = TorrentDesc::new(metainfo.clone());
+    let mut next_piece_idx = 0;
+    let mut pending_piece = false;
+
+    write_message(&mut stream, &Message::Interested)?;
+    write_message(&mut stream, &Message::Unchoke)?;
 
     loop {
-        for idx in 0..metainfo.info.pieces.len() {
-            let piece_idx = idx as u32;
-            let request_message = Message::Request {
-                index: piece_idx,
-                begin: 0,
-                length: 0,
-            };
+        let message = read_message(&mut stream)?;
+        println!("{message:#?}");
+        match message {
+            Message::Choke => chocked = true,
+            Message::Unchoke => chocked = false,
+            Message::Bitfield { .. } => panic!("received bitfield twice"),
+            Message::Piece { index, begin, data } => println!("received piece"),
+            _ => {}
         }
+
+        if !chocked && !pending_piece {
+            let piece_idx = next_piece_idx;
+            let piece_id = match state.pieces_map.get(piece_idx) {
+                Some(id) => id,
+                None => break,
+            };
+
+            let piece_desc = &mut state.pieces[piece_id];
+            let piece_len = piece_desc.length;
+
+            println!("sending piece request");
+            write_message(
+                &mut stream,
+                &Message::Request {
+                    index: piece_idx,
+                    begin: 0,
+                    length: 16 * 1024,
+                },
+            )?;
+            pending_piece = true;
+        }
+
+        // for idx in 0..metainfo.info.pieces.len() {
+        //     let piece_idx = idx as u32;
+        //     let request_message = Message::Request {
+        //         index: piece_idx,
+        //         begin: 0,
+        //         length: 0,
+        //     };
+        // }
     }
+
+    Ok(())
 }
 
 fn list_tracker_peers() {
