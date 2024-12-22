@@ -513,6 +513,7 @@ impl Wire for AnnounceIpv4Response {
     }
 }
 
+#[derive(Debug, Clone)]
 struct AnnounceParams {
     info_hash: Sha1,
     peer_id: PeerId,
@@ -639,18 +640,18 @@ enum MessageKind {
 }
 
 impl MessageKind {
-    fn from_u8(kind: u8) -> MessageKind {
+    fn from_u8(kind: u8) -> Option<MessageKind> {
         match kind {
-            _ if kind == MessageKind::Choke as u8 => MessageKind::Choke,
-            _ if kind == MessageKind::Unchoke as u8 => MessageKind::Unchoke,
-            _ if kind == MessageKind::Interested as u8 => MessageKind::Interested,
-            _ if kind == MessageKind::NotInterested as u8 => MessageKind::NotInterested,
-            _ if kind == MessageKind::Have as u8 => MessageKind::Have,
-            _ if kind == MessageKind::Bitfield as u8 => MessageKind::Bitfield,
-            _ if kind == MessageKind::Request as u8 => MessageKind::Request,
-            _ if kind == MessageKind::Piece as u8 => MessageKind::Piece,
-            _ if kind == MessageKind::Cancel as u8 => MessageKind::Cancel,
-            _ => panic!("invalid message kind"),
+            _ if kind == MessageKind::Choke as u8 => Some(MessageKind::Choke),
+            _ if kind == MessageKind::Unchoke as u8 => Some(MessageKind::Unchoke),
+            _ if kind == MessageKind::Interested as u8 => Some(MessageKind::Interested),
+            _ if kind == MessageKind::NotInterested as u8 => Some(MessageKind::NotInterested),
+            _ if kind == MessageKind::Have as u8 => Some(MessageKind::Have),
+            _ if kind == MessageKind::Bitfield as u8 => Some(MessageKind::Bitfield),
+            _ if kind == MessageKind::Request as u8 => Some(MessageKind::Request),
+            _ if kind == MessageKind::Piece as u8 => Some(MessageKind::Piece),
+            _ if kind == MessageKind::Cancel as u8 => Some(MessageKind::Cancel),
+            _ => None,
         }
     }
 
@@ -809,12 +810,23 @@ enum Message {
     Cancel { index: u32, begin: u32, length: u32 },
 }
 
-fn decode_message(buf: &[u8]) -> Message {
+fn decode_message(buf: &[u8]) -> std::io::Result<Message> {
     if buf.len() < 1 {
-        panic!("cannot read message type of empty message");
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "read empty buffer",
+        ));
     }
-    let message_kind = MessageKind::from_u8(buf[0]);
-    match message_kind {
+    let message_kind = match MessageKind::from_u8(buf[0]) {
+        Some(kind) => kind,
+        None => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unknown message kind: {}", buf[0]),
+            ));
+        }
+    };
+    let message = match message_kind {
         MessageKind::Choke => {
             // TODO: check len == 1
             Message::Choke
@@ -868,7 +880,8 @@ fn decode_message(buf: &[u8]) -> Message {
                 length,
             }
         }
-    }
+    };
+    Ok(message)
 }
 
 fn read_message<R: Read>(mut reader: R) -> std::io::Result<Message> {
@@ -878,7 +891,7 @@ fn read_message<R: Read>(mut reader: R) -> std::io::Result<Message> {
     let len = u32::from_be_bytes(len);
     buf.resize(len as usize, 0);
     reader.read_exact(&mut buf)?;
-    Ok(decode_message(&buf))
+    Ok(decode_message(&buf)?)
 }
 
 fn write_u32<W: Write>(mut writer: W, value: u32) -> std::io::Result<()> {
@@ -973,6 +986,7 @@ impl PieceKey {
 
 const CHUNK_LENGTH: u32 = 16 * 1024;
 const MAX_PEER_PENDING_CHUNKS: usize = 128;
+const PEER_COUNT_LIMIT: usize = 50;
 
 type Sender<T> = std::sync::mpsc::Sender<T>;
 type Receiver<T> = std::sync::mpsc::Receiver<T>;
@@ -1177,6 +1191,16 @@ impl TrackerIO {
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || tracker_entry(key, url, receiver, torrent_sender));
         Self { sender }
+    }
+
+    pub fn announce(&self, params: &AnnounceParams) {
+        self.send(TrackerMsg::Announce(params.clone()));
+    }
+
+    fn send(&self, msg: TrackerMsg) {
+        self.sender
+            .send(msg)
+            .expect("tracker receiver should not exit")
     }
 }
 
@@ -1445,6 +1469,7 @@ struct TrackerState {
     url: String,
     io: TrackerIO,
     next_announce: Instant,
+    status: String,
 }
 
 #[derive(Debug)]
@@ -1594,8 +1619,10 @@ impl TorrentState {
             TorrentMsg::PeerHandshake { key, id } => self.process_peer_handshake(key, id),
             TorrentMsg::PeerMessage { key, message } => self.process_peer_message(key, message),
             TorrentMsg::PeerError { key, error } => self.process_peer_error(key, error),
-            TorrentMsg::TrackerAnnounce { key, announce } => todo!(),
-            TorrentMsg::TrackerError { key, error } => todo!(),
+            TorrentMsg::TrackerAnnounce { key, announce } => {
+                self.process_tracker_announce(key, announce)
+            }
+            TorrentMsg::TrackerError { key, error } => self.process_tracker_error(key, error),
             TorrentMsg::ConnectToPeer { addr } => self.process_connect_to_peer(addr),
             TorrentMsg::WritePieceError { key, error } => {
                 self.process_write_piece_error(key, error)
@@ -1615,6 +1642,7 @@ impl TorrentState {
         //println!("tick");
         self.check_peer_interests();
         self.request_chunks();
+        self.trackers_announce();
     }
 
     fn process_peer_handshake(&mut self, key: PeerKey, id: PeerId) {
@@ -1750,11 +1778,31 @@ impl TorrentState {
         };
 
         tracker.next_announce = Instant::now() + Duration::from_secs(u64::from(announce.interval));
+        tracker.status = format!("ok");
+
+        self.process_tracker_address_list(announce.addresses.into_iter().map(From::from).collect());
     }
 
-    fn process_tracker_address_list(&mut self, addrs: Vec<SocketAddr>) {}
+    fn process_tracker_address_list(&mut self, mut addrs: Vec<SocketAddr>) {
+        println!("received peer list: {:#?}", addrs);
+        while self.peers.len() < PEER_COUNT_LIMIT {
+            let addr = match addrs.pop() {
+                Some(addr) => addr,
+                None => break,
+            };
+            self.process_connect_to_peer(addr);
+        }
+    }
 
-    fn process_tracker_error(&mut self, key: TrackerKey, error: std::io::Error) {}
+    fn process_tracker_error(&mut self, key: TrackerKey, error: std::io::Error) {
+        let tracker = match self.trackers.get_mut(key) {
+            Some(tracker) => tracker,
+            None => return,
+        };
+
+        tracker.next_announce = Instant::now() + Duration::from_secs(15);
+        tracker.status = format!("error: {error}");
+    }
 
     fn process_connect_to_peer(&mut self, addr: SocketAddr) {
         println!("received request to connect to peer at {addr}");
@@ -1810,6 +1858,66 @@ impl TorrentState {
         self.bitfield.unset(piece_index);
     }
 
+    fn trackers_add_default(&mut self) {
+        let urls = extract_tracker_urls(&self.info);
+        for url in urls {
+            self.tracker_add(url);
+        }
+    }
+
+    fn tracker_with_url_exists(&self, url: &str) -> bool {
+        self.trackers.values().any(|t| t.url == url)
+    }
+
+    fn tracker_add(&mut self, url: String) {
+        if self.tracker_with_url_exists(&url) {
+            return;
+        }
+
+        println!("adding tracker {url}");
+        self.trackers.insert_with_key({
+            let sender = self.sender.clone();
+            move |key| TrackerState {
+                url: url.clone(),
+                io: TrackerIO::new(key, url, sender),
+                next_announce: Instant::now(),
+                status: Default::default(),
+            }
+        });
+    }
+
+    fn trackers_announce(&mut self) {
+        let now = Instant::now();
+        let mut trackers = Vec::new();
+        for (key, tracker) in self.trackers.iter_mut() {
+            if tracker.next_announce < now {
+                trackers.push(key);
+            }
+        }
+
+        let params = AnnounceParams {
+            info_hash: self.info.info_hash,
+            peer_id: self.id,
+            downloaded: 0,
+            left: 0,
+            uploaded: 0,
+            event: Event::None,
+            ip_address: None,
+            num_want: None,
+            port: 0,
+        };
+
+        for key in trackers {
+            self.tracker_announce(key, &params);
+        }
+    }
+
+    fn tracker_announce(&mut self, key: TrackerKey, params: &AnnounceParams) {
+        let tracker = &mut self.trackers[key];
+        tracker.io.announce(params);
+        tracker.next_announce = Instant::now() + Duration::from_secs(300);
+    }
+
     fn attempt_finalize_piece(&mut self, piece_key: PieceKey) {
         let piece = &self.pieces[piece_key];
         let complete = piece
@@ -1858,6 +1966,10 @@ impl TorrentState {
 
     fn check_peer_interests(&mut self) {
         for (_peer_key, peer) in self.peers.iter_mut() {
+            if !peer.bitfield_received {
+                continue;
+            }
+
             let target_interest = peer.bitfield.contains_missing_in(&self.bitfield);
             let current_interest = peer.local_interested;
             if target_interest != current_interest {
@@ -1980,6 +2092,7 @@ impl Torrent {
 }
 
 fn torrent_entry(mut state: TorrentState) {
+    state.trackers_add_default();
     loop {
         let result = state.receiver.recv_timeout(Duration::from_secs(1));
         match result {
@@ -2025,6 +2138,19 @@ impl std::fmt::Display for ByteRateDisplay {
     }
 }
 
+fn extract_tracker_urls(info: &Metainfo) -> Vec<String> {
+    if info.announce_list.is_empty() {
+        vec![info.announce.clone()]
+    } else {
+        info.announce_list
+            .iter()
+            .map(|v| v.iter())
+            .flatten()
+            .cloned()
+            .collect()
+    }
+}
+
 fn extract_udp_tracker_addresses(info: &Metainfo) -> Vec<SocketAddr> {
     fn try_add_addr(out: &mut Vec<SocketAddr>, url: &str) {
         if let Some(addr_str) = url.strip_prefix("udp://") {
@@ -2053,26 +2179,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let content = std::fs::read("bunny.torrent").unwrap();
     let metainfo = bencode::decode::<Metainfo>(&content).unwrap();
 
-    println!("{:#?}", metainfo.announce);
-    println!("{:#?}", metainfo.announce_list);
-    println!("{:#?}", extract_udp_tracker_addresses(&metainfo));
-    let addrs = extract_udp_tracker_addresses(&metainfo);
-
-    let mut client = TrackerUdpClient::new(addrs[2])?;
-    let announce = client.announce(&AnnounceParams {
-        info_hash: metainfo.info_hash,
-        peer_id: Default::default(),
-        downloaded: 0,
-        left: metainfo.info.length,
-        uploaded: 0,
-        event: Event::Started,
-        ip_address: Default::default(),
-        num_want: Default::default(),
-        port: Default::default(),
-    })?;
-    println!("{announce:#?}");
-
-    return Ok(());
+    // println!("{:#?}", metainfo.announce);
+    // println!("{:#?}", metainfo.announce_list);
+    // println!("{:#?}", extract_udp_tracker_addresses(&metainfo));
+    // let addrs = extract_udp_tracker_addresses(&metainfo);
+    //
+    // let mut client = TrackerUdpClient::new(addrs[2])?;
+    // let announce = client.announce(&AnnounceParams {
+    //     info_hash: metainfo.info_hash,
+    //     peer_id: Default::default(),
+    //     downloaded: 0,
+    //     left: metainfo.info.length,
+    //     uploaded: 0,
+    //     event: Event::Started,
+    //     ip_address: Default::default(),
+    //     num_want: Default::default(),
+    //     port: Default::default(),
+    // })?;
+    // println!("{announce:#?}");
+    //
+    // return Ok(());
 
     // let torrent_state = TorrentState::from_metainfo(metainfo.clone());
     // for (_file_key, file) in torrent_state.files.iter() {
