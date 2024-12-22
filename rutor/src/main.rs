@@ -1,7 +1,7 @@
 use std::{
     collections::VecDeque,
-    io::{BufReader, BufWriter, Read, Seek, Write},
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream, UdpSocket},
+    io::{BufReader, BufWriter, Cursor, Read, Seek, Write},
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream, ToSocketAddrs, UdpSocket},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -513,6 +513,99 @@ impl Wire for AnnounceIpv4Response {
     }
 }
 
+struct AnnounceParams {
+    info_hash: Sha1,
+    peer_id: PeerId,
+    downloaded: u64,
+    left: u64,
+    uploaded: u64,
+    event: Event,
+    ip_address: Option<Ipv4Addr>,
+    num_want: Option<u32>,
+    port: u16,
+}
+
+#[derive(Debug)]
+struct Announce {
+    interval: u32,
+    leechers: u32,
+    seeders: u32,
+    addresses: Vec<SocketAddrV4>,
+}
+
+struct TrackerUdpClient {
+    socket: UdpSocket,
+    connection_id: Option<u64>,
+}
+
+impl TrackerUdpClient {
+    pub fn new(addr: SocketAddr) -> std::io::Result<Self> {
+        let socket = UdpSocket::bind("0.0.0.0:0")?;
+        socket.connect(addr)?;
+        socket.set_read_timeout(Some(Duration::from_secs(5)))?;
+        Ok(Self {
+            socket,
+            connection_id: None,
+        })
+    }
+
+    pub fn announce(&mut self, params: &AnnounceParams) -> std::io::Result<Announce> {
+        let connection_id = self.connect()?;
+        println!("connection id = {connection_id}");
+        let request = AnnounceIpv4Request {
+            connection_id,
+            transaction_id: random_transaction_id(),
+            info_hash: params.info_hash,
+            peer_id: params.peer_id,
+            downloaded: params.downloaded,
+            left: params.left,
+            uploaded: params.uploaded,
+            event: params.event,
+            ip_address: params.ip_address.unwrap_or(Ipv4Addr::new(0, 0, 0, 0)),
+            key: 0,
+            num_want: params.num_want.unwrap_or(u32::MAX),
+            port: params.port,
+        };
+
+        let mut buffer = [0u8; 1500];
+        request.encode(Cursor::new(&mut buffer[..]))?;
+        self.socket.send(&buffer[..])?;
+
+        let n = self.socket.recv(&mut buffer)?;
+        let buffer = &buffer[..n];
+        let response = AnnounceIpv4Response::decode(Cursor::new(buffer))?;
+        Ok(Announce {
+            interval: response.interval,
+            leechers: response.leechers,
+            seeders: response.seeders,
+            addresses: response.addresses,
+        })
+    }
+
+    fn connect(&mut self) -> std::io::Result<u64> {
+        if let Some(connection_id) = self.connection_id {
+            Ok(connection_id)
+        } else {
+            let mut buffer = Vec::default();
+            let request = ConnectRequest {
+                transaction_id: random_transaction_id(),
+            };
+            request.encode(&mut buffer)?;
+            self.socket.send(&buffer)?;
+
+            buffer.resize(1500, 0);
+            let n = self.socket.recv(&mut buffer)?;
+            buffer.truncate(n);
+            let response = ConnectResponse::decode(Cursor::new(&buffer))?;
+            Ok(response.connection_id)
+        }
+    }
+}
+
+fn random_transaction_id() -> u32 {
+    rand::random()
+}
+
 fn invalid_data(msg: &'static str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, msg)
 }
@@ -865,6 +958,7 @@ slotmap::new_key_type! {
     pub struct FileKey;
     pub struct ChunkKey;
     pub struct PeerKey;
+    pub struct TrackerKey;
 }
 
 impl PieceKey {
@@ -1069,6 +1163,92 @@ fn attempt_write_piece(path: &Path, offset: u64, data: &[u8]) -> std::io::Result
     Ok(())
 }
 
+enum TrackerMsg {
+    Announce(AnnounceParams),
+}
+
+#[derive(Debug)]
+struct TrackerIO {
+    sender: Sender<TrackerMsg>,
+}
+
+impl TrackerIO {
+    pub fn new(key: TrackerKey, url: String, torrent_sender: TorrentSender) -> Self {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tracker_entry(key, url, receiver, torrent_sender));
+        Self { sender }
+    }
+}
+
+fn tracker_entry(
+    key: TrackerKey,
+    url: String,
+    receiver: Receiver<TrackerMsg>,
+    sender: TorrentSender,
+) {
+    const ERROR_SLEEP_DURATION: Duration = Duration::from_secs(2);
+
+    'outer: loop {
+        // empty the queue of tracker requests
+        loop {
+            match receiver.try_recv() {
+                Ok(_) => {}
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => break 'outer,
+            };
+        }
+
+        let mut client = match tracker_create_client(&url) {
+            Ok(client) => client,
+            Err(error) => {
+                let _ = sender.send(TorrentMsg::TrackerError { key, error });
+                std::thread::sleep(ERROR_SLEEP_DURATION);
+                continue;
+            }
+        };
+
+        if let Err(error) = tracker_loop(key, &mut client, &receiver, &sender) {
+            let _ = sender.send(TorrentMsg::TrackerError { key, error });
+            std::thread::sleep(ERROR_SLEEP_DURATION);
+            continue;
+        }
+    }
+}
+
+fn tracker_create_client(url: &str) -> std::io::Result<TrackerUdpClient> {
+    let url = match url.strip_prefix("udp://") {
+        Some(url) => url,
+        None => return Err(std::io::Error::other("unsupported tracker protocol")),
+    };
+
+    let mut addrs = url.to_socket_addrs()?;
+    let addr = match addrs.next() {
+        Some(addr) => addr,
+        None => return Err(std::io::Error::other("failed to resolve tracker url")),
+    };
+
+    TrackerUdpClient::new(addr)
+}
+fn tracker_loop(
+    key: TrackerKey,
+    client: &mut TrackerUdpClient,
+    receiver: &Receiver<TrackerMsg>,
+    sender: &TorrentSender,
+) -> std::io::Result<()> {
+    while let Ok(msg) = receiver.recv() {
+        match msg {
+            TrackerMsg::Announce(params) => {
+                let response = client.announce(&params)?;
+                sender.send(TorrentMsg::TrackerAnnounce {
+                    key,
+                    announce: response,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct NetworkStats {
     pub download: u64,
@@ -1183,6 +1363,14 @@ enum TorrentMsg {
         key: PeerKey,
         error: std::io::Error,
     },
+    TrackerAnnounce {
+        key: TrackerKey,
+        announce: Announce,
+    },
+    TrackerError {
+        key: TrackerKey,
+        error: std::io::Error,
+    },
     ConnectToPeer {
         addr: SocketAddr,
     },
@@ -1253,6 +1441,13 @@ struct PeerState {
 }
 
 #[derive(Debug)]
+struct TrackerState {
+    url: String,
+    io: TrackerIO,
+    next_announce: Instant,
+}
+
+#[derive(Debug)]
 struct TorrentState {
     id: PeerId,
     info: ArcMetaInfo,
@@ -1265,6 +1460,7 @@ struct TorrentState {
     pieces: SecondaryMap<PieceKey, PieceState>,
     chunks: SlotMap<ChunkKey, ChunkState>,
     peers: SlotMap<PeerKey, PeerState>,
+    trackers: SlotMap<TrackerKey, TrackerState>,
     network_stats: NetworkStatsAccum,
     last_tick: Instant,
 }
@@ -1373,6 +1569,7 @@ impl TorrentState {
             pieces,
             chunks,
             peers: Default::default(),
+            trackers: Default::default(),
             network_stats: Default::default(),
             last_tick: Instant::now(),
         }
@@ -1397,6 +1594,8 @@ impl TorrentState {
             TorrentMsg::PeerHandshake { key, id } => self.process_peer_handshake(key, id),
             TorrentMsg::PeerMessage { key, message } => self.process_peer_message(key, message),
             TorrentMsg::PeerError { key, error } => self.process_peer_error(key, error),
+            TorrentMsg::TrackerAnnounce { key, announce } => todo!(),
+            TorrentMsg::TrackerError { key, error } => todo!(),
             TorrentMsg::ConnectToPeer { addr } => self.process_connect_to_peer(addr),
             TorrentMsg::WritePieceError { key, error } => {
                 self.process_write_piece_error(key, error)
@@ -1543,6 +1742,19 @@ impl TorrentState {
         println!("peer {addr} failed: {error}");
         self.disconnect_peer(key);
     }
+
+    fn process_tracker_announce(&mut self, key: TrackerKey, announce: Announce) {
+        let tracker = match self.trackers.get_mut(key) {
+            Some(tracker) => tracker,
+            None => return,
+        };
+
+        tracker.next_announce = Instant::now() + Duration::from_secs(u64::from(announce.interval));
+    }
+
+    fn process_tracker_address_list(&mut self, addrs: Vec<SocketAddr>) {}
+
+    fn process_tracker_error(&mut self, key: TrackerKey, error: std::io::Error) {}
 
     fn process_connect_to_peer(&mut self, addr: SocketAddr) {
         println!("received request to connect to peer at {addr}");
@@ -1813,9 +2025,54 @@ impl std::fmt::Display for ByteRateDisplay {
     }
 }
 
+fn extract_udp_tracker_addresses(info: &Metainfo) -> Vec<SocketAddr> {
+    fn try_add_addr(out: &mut Vec<SocketAddr>, url: &str) {
+        if let Some(addr_str) = url.strip_prefix("udp://") {
+            if let Ok(mut addrs) = addr_str.to_socket_addrs() {
+                if let Some(addr) = addrs.next() {
+                    out.push(addr);
+                }
+            }
+        }
+    }
+
+    let mut addrs = Vec::new();
+    if info.announce_list.is_empty() {
+        try_add_addr(&mut addrs, &info.announce);
+    } else {
+        for group in info.announce_list.iter() {
+            for url in group.iter() {
+                try_add_addr(&mut addrs, url);
+            }
+        }
+    }
+    addrs
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let content = std::fs::read("bunny.torrent").unwrap();
     let metainfo = bencode::decode::<Metainfo>(&content).unwrap();
+
+    println!("{:#?}", metainfo.announce);
+    println!("{:#?}", metainfo.announce_list);
+    println!("{:#?}", extract_udp_tracker_addresses(&metainfo));
+    let addrs = extract_udp_tracker_addresses(&metainfo);
+
+    let mut client = TrackerUdpClient::new(addrs[2])?;
+    let announce = client.announce(&AnnounceParams {
+        info_hash: metainfo.info_hash,
+        peer_id: Default::default(),
+        downloaded: 0,
+        left: metainfo.info.length,
+        uploaded: 0,
+        event: Event::Started,
+        ip_address: Default::default(),
+        num_want: Default::default(),
+        port: Default::default(),
+    })?;
+    println!("{announce:#?}");
+
+    return Ok(());
 
     // let torrent_state = TorrentState::from_metainfo(metainfo.clone());
     // for (_file_key, file) in torrent_state.files.iter() {
