@@ -2247,6 +2247,12 @@ impl TorrentState {
         self.process_tracker_address_list(announce.addresses.into_iter().map(From::from).collect());
     }
 
+    fn peers_broadcast_have(&mut self, piece_idx: PieceIdx) {
+        for peer in self.peers.values() {
+            peer.io.send(Message::Have { index: piece_idx });
+        }
+    }
+
     fn process_tracker_address_list(&mut self, mut addrs: Vec<SocketAddr>) {
         println!("received peer list: {:#?}", addrs);
         while self.peers.len() < PEER_COUNT_LIMIT {
@@ -2412,6 +2418,7 @@ impl TorrentState {
             let piece_index = piece_key.to_index();
             self.bitfield.set_piece(piece_index);
             self.disk_io.write_piece(piece_index, data);
+            self.peers_broadcast_have(piece_index);
             //println!("finalized piece {piece_index}");
         } else {
             for &chunk_key in piece.chunks.iter() {
