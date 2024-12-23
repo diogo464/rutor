@@ -38,6 +38,33 @@ impl std::fmt::Debug for Sha1 {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PieceIdx(u32);
+
+impl std::fmt::Display for PieceIdx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Piece({})", self.0)
+    }
+}
+
+impl From<PieceIdx> for u32 {
+    fn from(value: PieceIdx) -> Self {
+        value.0
+    }
+}
+
+impl From<u32> for PieceIdx {
+    fn from(value: u32) -> Self {
+        Self(value)
+    }
+}
+
+impl PieceIdx {
+    pub fn new(index: u32) -> Self {
+        Self(index)
+    }
+}
+
 #[derive(Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PeerId([u8; 20]);
 
@@ -58,6 +85,250 @@ impl std::fmt::Debug for PeerId {
     }
 }
 
+type TrackerUrl = String;
+
+struct TorrentInfoInner {
+    announce: TrackerUrl,
+    trackers: Vec<TrackerUrl>,
+    name: String,
+    comment: Option<String>,
+    creator: Option<String>,
+    piece_length: u32,
+    pieces: Vec<Sha1>,
+    info_hash: Sha1,
+    files: Vec<TorrentFile>,
+}
+
+impl std::fmt::Debug for TorrentInfoInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Torrent \n\tAnnounce : {:?}\n\tName : {:?}\n\tComment : {:?}\n\tCreator : {:?}\n\tPiece length : {:?}\n\tFiles : {:#?}\n",
+            self.announce, self.name, self.comment, self.creator, self.piece_length, self.files
+        )
+    }
+}
+
+#[derive(Clone)]
+pub struct TorrentInfo(Arc<TorrentInfoInner>);
+
+impl std::fmt::Debug for TorrentInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl TorrentInfo {
+    pub fn decode(buf: &[u8]) -> std::io::Result<Self> {
+        let metainfo = bencode::decode::<Metainfo>(buf).map_err(std::io::Error::other)?;
+        let mut files = Vec::with_capacity(metainfo.info.files.len());
+        let mut offset = 0;
+        for (index, file) in metainfo.info.files.into_iter().enumerate() {
+            files.push(TorrentFile {
+                index,
+                start: offset,
+                length: file.length,
+                path: PathBuf::from(file.path),
+            });
+            offset += file.length;
+        }
+
+        Ok(Self(Arc::new(TorrentInfoInner {
+            announce: metainfo.announce,
+            trackers: metainfo.announce_list.into_iter().flatten().collect(),
+            name: metainfo.info.name,
+            comment: metainfo.comment,
+            creator: metainfo.creator,
+            piece_length: metainfo.info.piece_length,
+            pieces: metainfo.info.pieces,
+            info_hash: metainfo.info_hash,
+            files,
+        })))
+    }
+
+    pub fn announce(&self) -> &TrackerUrl {
+        &self.0.announce
+    }
+
+    pub fn trackers(&self) -> &[TrackerUrl] {
+        &self.0.trackers
+    }
+
+    pub fn name(&self) -> &str {
+        self.0.name.as_str()
+    }
+
+    pub fn total_size(&self) -> u64 {
+        self.0.files.iter().map(|f| f.length).sum()
+    }
+
+    pub fn info_hash(&self) -> Sha1 {
+        self.0.info_hash
+    }
+
+    pub fn piece_length(&self) -> u32 {
+        self.0.piece_length
+    }
+
+    pub fn piece_indices(&self) -> impl Iterator<Item = PieceIdx> {
+        let piece_count = self.pieces_count();
+        (0..piece_count).map(|i| PieceIdx::new(i))
+    }
+
+    pub fn piece_length_from_index(&self, piece_index: PieceIdx) -> u32 {
+        let size = self.total_size();
+        let q = size / self.piece_length() as u64;
+        let r = size % self.piece_length() as u64;
+        match (piece_index.0 as u64).cmp(&q) {
+            std::cmp::Ordering::Greater => 0,
+            std::cmp::Ordering::Equal => r as u32,
+            std::cmp::Ordering::Less => self.piece_length(),
+        }
+    }
+
+    pub fn piece_index_valid(&self, piece_index: &PieceIdx) -> bool {
+        piece_index.0 < self.pieces_count()
+    }
+
+    pub fn piece_hash(&self, piece_index: &PieceIdx) -> Option<&Sha1> {
+        self.0.pieces.get(piece_index.0 as usize)
+    }
+
+    // returns the piece that contains that byte offset
+    pub fn piece_at_offset(&self, location: u64) -> Option<PieceIdx> {
+        if location >= self.total_size() {
+            None
+        } else {
+            let index = location / self.piece_length() as u64;
+            Some(PieceIdx::new(index as u32))
+        }
+    }
+
+    pub fn files_from_piece<'a>(
+        &'a self,
+        piece_index: PieceIdx,
+    ) -> impl Iterator<Item = TorrentFileRange<'a>> {
+        let piece_start = piece_index.0 as u64 * self.piece_length() as u64;
+        let piece_length = self.piece_length_from_index(piece_index);
+        let current_file = match self
+            .0
+            .files
+            .binary_search_by_key(&piece_start, |tf| tf.start)
+        {
+            Ok(cf) => cf,
+            Err(cf) => cf - 1,
+        };
+
+        //println!("piece_start(in torrent) : {}", piece_start);
+        //println!("piece_length : {}", piece_length);
+        //println!("current_file(index) : {}", current_file);
+
+        TorrentFileRangeIterator {
+            info: self,
+            piece_start,
+            piece_length,
+            current_file,
+        }
+    }
+
+    pub fn pieces_count(&self) -> u32 {
+        self.0.pieces.len() as u32
+    }
+
+    pub fn pieces(&self) -> &[Sha1] {
+        &self.0.pieces
+    }
+
+    pub fn files(&self) -> &[TorrentFile] {
+        &self.0.files
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TorrentFile {
+    index: usize,
+    start: u64,
+    length: u64,
+    path: PathBuf,
+    // TODO: add md5
+}
+
+impl TorrentFile {
+    pub fn index(&self) -> usize {
+        self.index
+    }
+
+    pub fn start(&self) -> &u64 {
+        &self.start
+    }
+
+    pub fn length(&self) -> &u64 {
+        &self.length
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TorrentFileRange<'a> {
+    /// The file a given piece belongs to
+    pub file: &'a TorrentFile,
+    /// Where in the file should this piece be placed
+    pub file_start: u64,
+    /// Where in the piece does this file start
+    pub piece_start: u32,
+    /// How much of the piece bellongs to this file
+    pub chunk_length: u32,
+}
+
+impl<'a> TorrentFileRange<'a> {
+    pub fn piece_range(&self) -> std::ops::Range<usize> {
+        self.piece_start as usize..(self.piece_start + self.chunk_length) as usize
+    }
+}
+
+struct TorrentFileRangeIterator<'a> {
+    info: &'a TorrentInfo,
+    // Offset in the torrent where this piece starts
+    piece_start: u64,
+    piece_length: u32,
+    // Index of the current file
+    current_file: usize,
+}
+
+impl<'a> Iterator for TorrentFileRangeIterator<'a> {
+    type Item = TorrentFileRange<'a>;
+    fn next(&mut self) -> Option<Self::Item> {
+        let curr_file = self.info.0.files.get(self.current_file)?;
+        if curr_file.start > self.piece_start + self.piece_length as u64 {
+            return None;
+        }
+        let file_start = self.piece_start.saturating_sub(curr_file.start);
+        let file_end = curr_file.start + curr_file.length;
+        let piece_start = curr_file.start.saturating_sub(self.piece_start) as u32;
+        let chunk_length = file_end
+            .saturating_sub(self.piece_start)
+            .min(self.piece_length.saturating_sub(piece_start) as u64)
+            as u32;
+        self.current_file += 1;
+
+        //println!("curr_file.start : {}", curr_file.start);
+        //println!("File start : {}", file_start);
+        //println!("piece_start(in torrent) : {}", self.piece_start);
+        //println!("piece_start(in file) : {}", piece_start);
+        //println!("chunk length : {}", chunk_length);
+
+        Some(TorrentFileRange {
+            file: curr_file,
+            file_start,
+            piece_start,
+            chunk_length,
+        })
+    }
+}
+
 type ArcMetaInfo = Arc<Metainfo>;
 
 #[derive(Debug, Clone)]
@@ -66,6 +337,8 @@ pub struct Metainfo {
     pub announce_list: Vec<Vec<String>>,
     pub info: Info,
     pub info_hash: Sha1,
+    pub creator: Option<String>,
+    pub comment: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -77,7 +350,7 @@ pub struct InfoFile {
 #[derive(Debug, Clone)]
 pub struct Info {
     pub name: String,
-    pub piece_length: u64,
+    pub piece_length: u32,
     pub length: u64,
     pub pieces: Vec<Sha1>,
     pub files: Vec<InfoFile>,
@@ -86,8 +359,8 @@ pub struct Info {
 impl Info {
     pub fn piece_length(&self, index: u32) -> u32 {
         let mut l = self.length;
-        l = l.saturating_sub(u64::from(index) * self.piece_length);
-        l.min(self.piece_length) as u32
+        l = l.saturating_sub(u64::from(index) * u64::from(self.piece_length));
+        l.min(u64::from(self.piece_length)) as u32
     }
 }
 
@@ -175,11 +448,15 @@ impl bencode::FromValue for Metainfo {
         let info_dict = dict.require_value(b"info")?;
         let info = Info::from_value(&info_dict)?;
         let info_hash = Sha1::hash(info_dict.bytes);
+        let creator = dict.find(b"created by")?;
+        let comment = dict.find(b"comment")?;
         Ok(Self {
             announce,
             announce_list,
             info,
             info_hash,
+            creator,
+            comment,
         })
     }
 }
@@ -723,79 +1000,272 @@ fn read_handshake<R: Read>(mut reader: R) -> std::io::Result<Handshake> {
 }
 
 #[derive(Default, Clone)]
-pub struct Bitfield {
+pub struct PieceBitfield {
     data: Vec<u8>,
-    bits: usize,
+    size: u32,
 }
 
-impl std::fmt::Debug for Bitfield {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("Bitfield").field(&self.bits).finish()
-    }
-}
-
-impl Bitfield {
-    fn new(mut data: Vec<u8>, bits: usize) -> Self {
-        let vec_len = (bits + 7) / 8;
-        data.resize(vec_len, 0);
-        Self { data, bits }
+impl PieceBitfield {
+    pub fn new() -> Self {
+        Default::default()
     }
 
-    fn empty(bits: usize) -> Self {
-        Self::new(Default::default(), bits)
+    // size is the number of bits required
+    pub fn with_size(size: u32) -> Self {
+        let data = vec![0u8; Self::required_vec_capacity(size)];
+        Self { data, size }
     }
 
-    fn set(&mut self, index: u32) {
-        let index = index as usize;
-        assert!(index < self.bits);
-        let byte_index = index / 8;
-        self.data[byte_index] |= 1 << (index % 8);
+    pub fn from_vec(bytes: Vec<u8>, size: u32) -> Self {
+        let mut data = bytes;
+        data.resize(size.try_into().unwrap(), 0);
+        Self { data, size }
     }
 
-    fn unset(&mut self, index: u32) {
-        let index = index as usize;
-        assert!(index < self.bits);
-        let byte_index = index / 8;
-        self.data[byte_index] &= !(1 << (index % 8));
+    pub fn has_piece(&self, index: PieceIdx) -> bool {
+        let (byte_index, bit_index) = self.get_indices(index.0);
+        (self.data[byte_index] & (1 << bit_index)) > 0
     }
 
-    fn test(&self, index: u32) -> bool {
-        let index = index as usize;
-        assert!(index < self.bits);
-        let byte_index = index / 8;
-        (self.data[byte_index] & 1 << (index % 8)) != 0
+    pub fn set_piece(&mut self, index: PieceIdx) {
+        let (byte_index, bit_index) = self.get_indices(index.0);
+        self.data[byte_index] = self.data[byte_index] | (1 << bit_index);
     }
 
-    fn complete(&self) -> bool {
-        if !self.data.iter().take(self.bits / 8).all(|&b| b == 0xFF) {
-            return false;
-        }
-        if self.bits % 8 != 0 {
-            if self.data[self.data.len() - 1] != !(1 << self.bits % 8) {
+    pub fn unset_piece(&mut self, index: PieceIdx) {
+        let (byte_index, bit_index) = self.get_indices(index.0);
+        self.data[byte_index] = self.data[byte_index] & !(1 << bit_index);
+    }
+
+    pub fn piece_capacity(&self) -> u32 {
+        (self.data.len() * 8) as u32
+    }
+
+    pub fn resize(&mut self, new_size: u32) {
+        self.data.resize(Self::required_vec_capacity(new_size), 0);
+        self.size = new_size;
+    }
+
+    pub fn complete(&self) -> bool {
+        for i in 0..self.size {
+            if !self.has_piece(PieceIdx::from(i)) {
                 return false;
             }
         }
         true
     }
 
-    fn contains_missing_in(&self, other: &Self) -> bool {
-        assert_eq!(self.bits, other.bits);
-        for (&lhs, &rhs) in self.data.iter().zip(other.data.iter()) {
-            if lhs & !rhs != 0 {
-                return true;
-            }
-        }
-        false
+    pub fn len(&self) -> u32 {
+        self.size
     }
 
-    fn iter_missing_in<'s>(&'s self, other: &'s Self) -> impl Iterator<Item = u32> + 's {
-        // TODO: improve function
-        (0..self.bits)
-            .map(|idx| (idx as u32, self.test(idx as u32), other.test(idx as u32)))
-            .filter(|(_, lhs, rhs)| *lhs && !*rhs)
-            .map(|(idx, _, _)| idx)
+    pub fn bytes(&self) -> &[u8] {
+        self.as_ref()
+    }
+
+    /// Iterator over pieces that this bitfield contains
+    pub fn pieces(&self) -> impl Iterator<Item = PieceIdx> + '_ {
+        (0..self.len())
+            .filter(move |p| self.has_piece(PieceIdx::new(*p)))
+            .map(|p| PieceIdx::new(p))
+    }
+
+    pub fn missing_pieces(&self) -> impl Iterator<Item = PieceIdx> + '_ {
+        (0..self.len())
+            .filter(move |p| !self.has_piece(PieceIdx::new(*p)))
+            .map(|p| PieceIdx::new(p))
+    }
+
+    pub fn missing_pieces_in<'s>(&'s self, other: &'s Self) -> impl Iterator<Item = PieceIdx> + 's {
+        assert_eq!(self.len(), other.len());
+        (0..self.len())
+            .filter(move |p| {
+                let index = PieceIdx::from(*p);
+                !self.has_piece(index) && other.has_piece(index)
+            })
+            .map(|p| PieceIdx::new(p))
+    }
+
+    pub fn contains_missing_in(&self, other: &Self) -> bool {
+        other.missing_pieces_in(self).next().is_some()
+    }
+
+    // returns (byte_index, bit_index), panics if index is invalid
+    fn get_indices(&self, index: u32) -> (usize, usize) {
+        if index > self.piece_capacity() {
+            panic!("Bitfield not large enough for index : {}", index);
+        }
+        let byte_index = index as usize / 8;
+        let bit_index = 7 - index as usize % 8;
+        (byte_index, bit_index)
+    }
+
+    fn required_vec_capacity(num_bits: u32) -> usize {
+        (num_bits / 8 + (num_bits % 8).min(1)) as usize
     }
 }
+
+impl std::fmt::Debug for PieceBitfield {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PieceBitfield")
+            .field("bits", &self.size)
+            .finish()
+    }
+}
+
+impl AsRef<[u8]> for PieceBitfield {
+    fn as_ref(&self) -> &[u8] {
+        &self.data
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn creation() {
+        let bf = PieceBitfield::with_size(33);
+        assert_eq!(bf.piece_capacity(), 40);
+    }
+
+    #[test]
+    fn creation_all_zeros() {
+        let bf = PieceBitfield::with_size(32);
+        for i in 0..bf.piece_capacity() {
+            assert!(!bf.has_piece(PieceIdx::new(i)));
+        }
+    }
+
+    #[test]
+    fn setting_bits() {
+        let mut bf = PieceBitfield::with_size(32);
+        bf.set_piece(PieceIdx::new(5));
+        bf.set_piece(PieceIdx::new(9));
+        bf.set_piece(PieceIdx::new(30));
+
+        assert!(bf.has_piece(PieceIdx::new(5)));
+        assert!(bf.has_piece(PieceIdx::new(9)));
+        assert!(bf.has_piece(PieceIdx::new(30)));
+
+        for i in 0..bf.piece_capacity() {
+            assert!(!bf.has_piece(PieceIdx::new(i)) || i == 5 || i == 9 || i == 30);
+        }
+    }
+
+    #[test]
+    fn removing_bits() {
+        let mut bf = PieceBitfield::with_size(32);
+        bf.set_piece(PieceIdx::new(5));
+        bf.set_piece(PieceIdx::new(9));
+        bf.set_piece(PieceIdx::new(30));
+
+        bf.unset_piece(PieceIdx::new(9));
+
+        assert!(bf.has_piece(PieceIdx::new(5)));
+        assert!(bf.has_piece(PieceIdx::new(30)));
+
+        for i in 0..bf.piece_capacity() {
+            assert!(!bf.has_piece(PieceIdx::new(i)) || i == 5 || i == 30);
+        }
+    }
+
+    #[test]
+    fn missing_pieces_in() {
+        let mut bf0 = PieceBitfield::with_size(32);
+        let mut bf1 = PieceBitfield::with_size(32);
+
+        bf0.set_piece(PieceIdx::new(5));
+        bf0.set_piece(PieceIdx::new(9));
+        bf0.set_piece(PieceIdx::new(30));
+
+        bf1.set_piece(PieceIdx::new(9));
+
+        let mut iter = bf1.missing_pieces_in(&bf0);
+        assert_eq!(iter.next(), Some(PieceIdx::new(5)));
+        assert_eq!(iter.next(), Some(PieceIdx::new(30)));
+        assert_eq!(iter.next(), None);
+    }
+}
+
+// #[derive(Default, Clone)]
+// pub struct Bitfield {
+//     data: Vec<u8>,
+//     num_pieces: u32,
+// }
+//
+// impl std::fmt::Debug for Bitfield {
+//     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+//         f.debug_tuple("Bitfield").field(&self.num_pieces).finish()
+//     }
+// }
+//
+// impl Bitfield {
+//     fn new(mut data: Vec<u8>, num_pieces: u32) -> Self {
+//         let vec_len = (num_pieces + 7) / 8;
+//         data.resize(vec_len as usize, 0);
+//         Self { data, num_pieces }
+//     }
+//
+//     fn empty(num_pieces: u32) -> Self {
+//         Self::new(Default::default(), num_pieces)
+//     }
+//
+//     fn set(&mut self, index: PieceIdx) {
+//         let index = u32::from(index);
+//         assert!(index < self.num_pieces);
+//         let byte_index = index / 8;
+//         self.data[byte_index as usize] |= 1 << (index % 8);
+//     }
+//
+//     fn unset(&mut self, index: PieceIdx) {
+//         let index = u32::from(index);
+//         assert!(index < self.num_pieces);
+//         let byte_index = index / 8;
+//         self.data[byte_index as usize] &= !(1 << (index % 8));
+//     }
+//
+//     fn test(&self, index: u32) -> bool {
+//         assert!(index < self.num_pieces);
+//         let byte_index = index / 8;
+//         (self.data[byte_index as usize] & 1 << (index % 8)) != 0
+//     }
+//
+//     fn complete(&self) -> bool {
+//         if !self
+//             .data
+//             .iter()
+//             .take((self.num_pieces / 8) as usize)
+//             .all(|&b| b == 0xFF)
+//         {
+//             return false;
+//         }
+//         if self.num_pieces % 8 != 0 {
+//             if self.data[self.data.len() - 1] != !(1 << self.num_pieces % 8) {
+//                 return false;
+//             }
+//         }
+//         true
+//     }
+//
+//     fn contains_missing_in(&self, other: &Self) -> bool {
+//         assert_eq!(self.num_pieces, other.num_pieces);
+//         for (&lhs, &rhs) in self.data.iter().zip(other.data.iter()) {
+//             if lhs & !rhs != 0 {
+//                 return true;
+//             }
+//         }
+//         false
+//     }
+//
+//     fn iter_missing_in<'s>(&'s self, other: &'s Self) -> impl Iterator<Item = PieceIdx> + 's {
+//         // TODO: improve function
+//         (0..self.num_pieces)
+//             .map(|idx| (idx as u32, self.test(idx as u32), other.test(idx as u32)))
+//             .filter(|(_, lhs, rhs)| *lhs && !*rhs)
+//             .map(|(idx, _, _)| PieceIdx::from(idx))
+//     }
+// }
 
 #[derive(Debug)]
 enum Message {
@@ -803,11 +1273,27 @@ enum Message {
     Unchoke,
     Interested,
     NotInterested,
-    Have { index: u32 },
-    Bitfield { bitfield: Vec<u8> },
-    Request { index: u32, begin: u32, length: u32 },
-    Piece { index: u32, begin: u32, data: Bytes },
-    Cancel { index: u32, begin: u32, length: u32 },
+    Have {
+        index: PieceIdx,
+    },
+    Bitfield {
+        bitfield: Vec<u8>,
+    },
+    Request {
+        index: PieceIdx,
+        begin: u32,
+        length: u32,
+    },
+    Piece {
+        index: PieceIdx,
+        begin: u32,
+        data: Bytes,
+    },
+    Cancel {
+        index: PieceIdx,
+        begin: u32,
+        length: u32,
+    },
 }
 
 fn decode_message(buf: &[u8]) -> std::io::Result<Message> {
@@ -845,7 +1331,7 @@ fn decode_message(buf: &[u8]) -> std::io::Result<Message> {
         }
         MessageKind::Have => {
             // TODO: check len == 5
-            let index = u32::from_be_bytes(buf[1..5].try_into().unwrap());
+            let index = PieceIdx::from(u32::from_be_bytes(buf[1..5].try_into().unwrap()));
             Message::Have { index }
         }
         MessageKind::Bitfield => Message::Bitfield {
@@ -853,7 +1339,7 @@ fn decode_message(buf: &[u8]) -> std::io::Result<Message> {
         },
         MessageKind::Request => {
             // TODO: check len == 13
-            let index = u32::from_be_bytes(buf[1..5].try_into().unwrap());
+            let index = PieceIdx::from(u32::from_be_bytes(buf[1..5].try_into().unwrap()));
             let begin = u32::from_be_bytes(buf[5..9].try_into().unwrap());
             let length = u32::from_be_bytes(buf[9..13].try_into().unwrap());
             Message::Request {
@@ -864,14 +1350,14 @@ fn decode_message(buf: &[u8]) -> std::io::Result<Message> {
         }
         MessageKind::Piece => {
             // TODO: check len >= 9
-            let index = u32::from_be_bytes(buf[1..5].try_into().unwrap());
+            let index = PieceIdx::from(u32::from_be_bytes(buf[1..5].try_into().unwrap()));
             let begin = u32::from_be_bytes(buf[5..9].try_into().unwrap());
             let data = Bytes::copy_from_slice(&buf[9..]);
             Message::Piece { index, begin, data }
         }
         MessageKind::Cancel => {
             // TODO: check len == 13
-            let index = u32::from_be_bytes(buf[1..5].try_into().unwrap());
+            let index = PieceIdx::from(u32::from_be_bytes(buf[1..5].try_into().unwrap()));
             let begin = u32::from_be_bytes(buf[5..9].try_into().unwrap());
             let length = u32::from_be_bytes(buf[9..13].try_into().unwrap());
             Message::Request {
@@ -923,7 +1409,7 @@ fn write_message<W: Write>(mut writer: W, message: &Message) -> std::io::Result<
         Message::Have { index } => {
             write_u32(&mut writer, 5)?;
             write_message_kind(&mut writer, MessageKind::Have)?;
-            write_u32(&mut writer, *index)?;
+            write_u32(&mut writer, u32::from(*index))?;
             Ok(())
         }
         Message::Bitfield { bitfield } => {
@@ -939,7 +1425,7 @@ fn write_message<W: Write>(mut writer: W, message: &Message) -> std::io::Result<
         } => {
             write_u32(&mut writer, 13)?;
             write_message_kind(&mut writer, MessageKind::Request)?;
-            write_u32(&mut writer, *index)?;
+            write_u32(&mut writer, u32::from(*index))?;
             write_u32(&mut writer, *begin)?;
             write_u32(&mut writer, *length)?;
             Ok(())
@@ -947,7 +1433,7 @@ fn write_message<W: Write>(mut writer: W, message: &Message) -> std::io::Result<
         Message::Piece { index, begin, data } => {
             let len = 8 + data.len() as u32;
             write_u32(&mut writer, len)?;
-            write_u32(&mut writer, *index)?;
+            write_u32(&mut writer, u32::from(*index))?;
             write_u32(&mut writer, *begin)?;
             writer.write_all(&data)?;
             Ok(())
@@ -958,7 +1444,7 @@ fn write_message<W: Write>(mut writer: W, message: &Message) -> std::io::Result<
             length,
         } => {
             write_u32(&mut writer, 12)?;
-            write_u32(&mut writer, *index)?;
+            write_u32(&mut writer, u32::from(*index))?;
             write_u32(&mut writer, *begin)?;
             write_u32(&mut writer, *length)?;
             Ok(())
@@ -975,17 +1461,17 @@ slotmap::new_key_type! {
 }
 
 impl PieceKey {
-    pub fn from_index(index: u32) -> PieceKey {
-        PieceKey::from(slotmap::KeyData::from_ffi(u64::from(index)))
+    pub fn from_index(index: PieceIdx) -> PieceKey {
+        PieceKey::from(slotmap::KeyData::from_ffi(u64::from(u32::from(index))))
     }
 
-    pub fn to_index(&self) -> u32 {
-        (self.data().as_ffi() & 0xFFFFFFFF) as u32
+    pub fn to_index(&self) -> PieceIdx {
+        PieceIdx::from((self.data().as_ffi() & 0xFFFFFFFF) as u32)
     }
 }
 
 const CHUNK_LENGTH: u32 = 16 * 1024;
-const MAX_PEER_PENDING_CHUNKS: usize = 128;
+const MAX_PEER_PENDING_CHUNKS: usize = 256;
 const PEER_COUNT_LIMIT: usize = 50;
 
 type Sender<T> = std::sync::mpsc::Sender<T>;
@@ -1111,12 +1597,7 @@ fn peer_io_writer(
 }
 
 enum DiskIOMsg {
-    WritePiece {
-        key: PieceKey,
-        path: PathBuf,
-        offset: u64,
-        data: Bytes,
-    },
+    WritePiece { idx: PieceIdx, data: Bytes },
 }
 
 #[derive(Debug)]
@@ -1125,19 +1606,14 @@ struct DiskIO {
 }
 
 impl DiskIO {
-    pub fn new(torrent_sender: TorrentSender) -> Self {
+    pub fn new(info: TorrentInfo, torrent_sender: TorrentSender) -> Self {
         let (sender, receiver) = std::sync::mpsc::channel();
-        std::thread::spawn(move || disk_io_entry(receiver, torrent_sender));
+        std::thread::spawn(move || disk_io_entry(info, receiver, torrent_sender));
         Self { sender }
     }
 
-    pub fn write_piece(&self, key: PieceKey, path: &Path, offset: u64, data: Bytes) {
-        self.send(DiskIOMsg::WritePiece {
-            key,
-            path: path.to_path_buf(),
-            offset,
-            data,
-        });
+    pub fn write_piece(&self, idx: PieceIdx, data: Bytes) {
+        self.send(DiskIOMsg::WritePiece { idx, data });
     }
 
     fn send(&self, msg: DiskIOMsg) {
@@ -1145,20 +1621,23 @@ impl DiskIO {
     }
 }
 
-fn disk_io_entry(receiver: Receiver<DiskIOMsg>, sender: TorrentSender) {
+fn disk_io_entry(info: TorrentInfo, receiver: Receiver<DiskIOMsg>, sender: TorrentSender) {
     while let Ok(msg) = receiver.recv() {
         match msg {
-            DiskIOMsg::WritePiece {
-                key,
-                path,
-                offset,
-                data,
-            } => match attempt_write_piece(&path, offset, &data) {
-                Ok(_) => {}
-                Err(error) => {
-                    let _ = sender.send(TorrentMsg::WritePieceError { key, error });
+            DiskIOMsg::WritePiece { idx, data } => {
+                for range in info.files_from_piece(idx) {
+                    match attempt_write_piece(
+                        &range.file.path,
+                        range.file_start,
+                        &data[range.piece_range()],
+                    ) {
+                        Ok(_) => {}
+                        Err(error) => {
+                            let _ = sender.send(TorrentMsg::WritePieceError { idx, error });
+                        }
+                    }
                 }
-            },
+            }
         }
     }
 }
@@ -1399,7 +1878,7 @@ enum TorrentMsg {
         addr: SocketAddr,
     },
     WritePieceError {
-        key: PieceKey,
+        idx: PieceIdx,
         error: std::io::Error,
     },
     NetworkStats {
@@ -1452,7 +1931,7 @@ struct PeerState {
     /// have we received the bitfield from the remote peer?
     /// if the first message is not the bitfield, then it is implied that it is empty
     bitfield_received: bool,
-    bitfield: Bitfield,
+    bitfield: PieceBitfield,
     /// are we chocked by the peer
     remote_choke: bool,
     /// are we choking the peer
@@ -1475,12 +1954,12 @@ struct TrackerState {
 #[derive(Debug)]
 struct TorrentState {
     id: PeerId,
-    info: ArcMetaInfo,
+    info: TorrentInfo,
     sender: TorrentSender,
     receiver: TorrentReceiver,
     disk_io: DiskIO,
     queue: VecDeque<TorrentMsg>,
-    bitfield: Bitfield,
+    bitfield: PieceBitfield,
     files: SlotMap<FileKey, FileState>,
     pieces: SecondaryMap<PieceKey, PieceState>,
     chunks: SlotMap<ChunkKey, ChunkState>,
@@ -1491,7 +1970,7 @@ struct TorrentState {
 }
 
 impl TorrentState {
-    pub fn from_metainfo(info: Metainfo) -> Self {
+    pub fn from_info(info: TorrentInfo) -> Self {
         let mut pieces = SecondaryMap::<PieceKey, PieceState>::default();
         let mut chunks = SlotMap::<ChunkKey, ChunkState>::default();
         let mut files = SlotMap::<FileKey, FileState>::default();
@@ -1499,8 +1978,8 @@ impl TorrentState {
 
         {
             let mut current_offset = 0;
-            let parent_path = PathBuf::from(info.info.name.clone());
-            for file in info.info.files.iter() {
+            let parent_path = PathBuf::from(info.name());
+            for file in info.files() {
                 let path = parent_path.join(PathBuf::from(file.path.clone()));
                 let file_key = files.insert(FileState {
                     path,
@@ -1512,10 +1991,9 @@ impl TorrentState {
             }
         }
 
-        for (index, &hash) in info.info.pieces.iter().enumerate() {
-            let index = index as u32;
+        for (index, &hash) in info.piece_indices().zip(info.pieces()) {
             let piece_key = PieceKey::from_index(index);
-            let piece_length = info.info.piece_length(index);
+            let piece_length = info.piece_length_from_index(index);
             let num_chunks = (piece_length + CHUNK_LENGTH - 1) / CHUNK_LENGTH;
             pieces.insert(
                 piece_key,
@@ -1529,30 +2007,16 @@ impl TorrentState {
             assert_eq!(piece_key.to_index(), index);
 
             let piece_ranges = {
-                let piece_begin = u64::from(index) * info.info.piece_length;
-                let piece_end = piece_begin + u64::from(piece_length);
                 let mut ranges = Vec::default();
-                for &file_key in file_keys.iter() {
-                    let file = &files[file_key];
-                    let file_begin = file.offset;
-                    let file_end = file_begin + file.length;
+                for range in info.files_from_piece(index) {
+                    let file_key = file_keys[range.file.index()];
 
-                    if (piece_begin >= file_begin && piece_begin < file_end)
-                        || (piece_end >= file_begin && piece_end < file_end)
-                    {
-                        let range_begin = piece_begin.max(file_begin);
-                        let range_end = piece_end.min(file_end);
-                        let range_length = range_end - range_begin;
-                        let file_offset = range_begin - file_begin;
-                        let piece_offset = (range_begin - piece_begin) as u32;
-
-                        ranges.push(PieceFileRange {
-                            file: file_key,
-                            file_offset,
-                            piece_offset,
-                            length: range_length as u32,
-                        });
-                    }
+                    ranges.push(PieceFileRange {
+                        file: file_key,
+                        file_offset: range.file_start,
+                        piece_offset: range.piece_start,
+                        length: range.chunk_length,
+                    });
                 }
 
                 ranges
@@ -1580,11 +2044,11 @@ impl TorrentState {
         }
 
         let (sender, receiver) = std::sync::mpsc::channel();
-        let bitfield = Bitfield::empty(info.info.pieces.len());
-        let disk_io = DiskIO::new(sender.clone());
+        let bitfield = PieceBitfield::with_size(info.pieces_count());
+        let disk_io = DiskIO::new(info.clone(), sender.clone());
         Self {
             id: Default::default(),
-            info: Arc::new(info),
+            info,
             sender,
             receiver,
             disk_io,
@@ -1624,8 +2088,8 @@ impl TorrentState {
             }
             TorrentMsg::TrackerError { key, error } => self.process_tracker_error(key, error),
             TorrentMsg::ConnectToPeer { addr } => self.process_connect_to_peer(addr),
-            TorrentMsg::WritePieceError { key, error } => {
-                self.process_write_piece_error(key, error)
+            TorrentMsg::WritePieceError { idx, error } => {
+                self.process_write_piece_error(idx, error)
             }
             TorrentMsg::NetworkStats { res } => {
                 let stats = self.network_stats.stats();
@@ -1681,12 +2145,12 @@ impl TorrentState {
                 return;
             }
             peer.bitfield_received = true;
-            peer.bitfield = Bitfield::new(bitfield, self.info.info.pieces.len());
+            peer.bitfield = PieceBitfield::from_vec(bitfield, self.info.pieces_count());
         } else {
             if !peer.bitfield_received {
                 println!("received peer message before bitfield, assuming empty bitfield");
                 peer.bitfield_received = true;
-                peer.bitfield = Bitfield::new(Default::default(), self.info.info.pieces.len());
+                peer.bitfield = PieceBitfield::with_size(self.info.pieces_count());
             }
 
             match message {
@@ -1713,7 +2177,7 @@ impl TorrentState {
                         self.disconnect_peer(key);
                         return;
                     }
-                    peer.bitfield.set(index);
+                    peer.bitfield.set_piece(index);
                 }
                 Message::Bitfield { .. } => unreachable!(),
                 Message::Request {
@@ -1811,8 +2275,13 @@ impl TorrentState {
         }
 
         self.peers.insert_with_key(|key| {
-            let peer_io =
-                PeerIO::connect(key, self.sender.clone(), addr, self.id, self.info.info_hash);
+            let peer_io = PeerIO::connect(
+                key,
+                self.sender.clone(),
+                addr,
+                self.id,
+                self.info.info_hash(),
+            );
             PeerState {
                 id: Default::default(),
                 io: peer_io,
@@ -1852,10 +2321,9 @@ impl TorrentState {
         self.request_chunks_from(peer_key);
     }
 
-    fn process_write_piece_error(&mut self, piece_key: PieceKey, error: std::io::Error) {
-        let piece_index = piece_key.to_index();
-        println!("failed to write piece {piece_index}: {error}");
-        self.bitfield.unset(piece_index);
+    fn process_write_piece_error(&mut self, piece_idx: PieceIdx, error: std::io::Error) {
+        println!("failed to write piece {piece_idx}: {error}");
+        self.bitfield.unset_piece(piece_idx);
     }
 
     fn trackers_add_default(&mut self) {
@@ -1896,7 +2364,7 @@ impl TorrentState {
         }
 
         let params = AnnounceParams {
-            info_hash: self.info.info_hash,
+            info_hash: self.info.info_hash(),
             peer_id: self.id,
             downloaded: 0,
             left: 0,
@@ -1942,18 +2410,8 @@ impl TorrentState {
         let hash = Sha1::hash(&data);
         if hash == piece.hash {
             let piece_index = piece_key.to_index();
-            self.bitfield.set(piece_index);
-            for range in piece.ranges.iter() {
-                let file = &self.files[range.file];
-                self.disk_io.write_piece(
-                    piece_key,
-                    &file.path,
-                    range.file_offset,
-                    data.slice(
-                        range.piece_offset as usize..(range.piece_offset + range.length) as usize,
-                    ),
-                );
-            }
+            self.bitfield.set_piece(piece_index);
+            self.disk_io.write_piece(piece_index, data);
             //println!("finalized piece {piece_index}");
         } else {
             for &chunk_key in piece.chunks.iter() {
@@ -1999,7 +2457,7 @@ impl TorrentState {
 
     fn request_chunks_from(&mut self, peer_key: PeerKey) {
         let peer = &mut self.peers[peer_key];
-        let mut missing_iter = peer.bitfield.iter_missing_in(&self.bitfield);
+        let mut missing_iter = self.bitfield.missing_pieces_in(&peer.bitfield);
         while peer.pending_chunks.len() < MAX_PEER_PENDING_CHUNKS {
             let piece_idx = match missing_iter.next() {
                 Some(idx) => idx,
@@ -2055,8 +2513,8 @@ struct Torrent {
 }
 
 impl Torrent {
-    pub fn new(metainfo: Metainfo) -> Self {
-        let state = TorrentState::from_metainfo(metainfo);
+    pub fn new(info: TorrentInfo) -> Self {
+        let state = TorrentState::from_info(info);
         let sender = state.sender.clone();
         std::thread::spawn(move || torrent_entry(state));
         Self { sender }
@@ -2138,16 +2596,11 @@ impl std::fmt::Display for ByteRateDisplay {
     }
 }
 
-fn extract_tracker_urls(info: &Metainfo) -> Vec<String> {
-    if info.announce_list.is_empty() {
-        vec![info.announce.clone()]
+fn extract_tracker_urls(info: &TorrentInfo) -> Vec<String> {
+    if info.trackers().is_empty() {
+        vec![info.announce().clone()]
     } else {
-        info.announce_list
-            .iter()
-            .map(|v| v.iter())
-            .flatten()
-            .cloned()
-            .collect()
+        info.trackers().iter().cloned().collect()
     }
 }
 
@@ -2177,7 +2630,9 @@ fn extract_udp_tracker_addresses(info: &Metainfo) -> Vec<SocketAddr> {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let content = std::fs::read("bunny.torrent").unwrap();
-    let metainfo = bencode::decode::<Metainfo>(&content).unwrap();
+    let torrent_info = TorrentInfo::decode(&content)?;
+    println!("{torrent_info:#?}");
+    //return Ok(());
 
     // println!("{:#?}", metainfo.announce);
     // println!("{:#?}", metainfo.announce_list);
@@ -2218,7 +2673,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // }
     // return Ok(());
 
-    let torrent = Torrent::new(metainfo);
+    let torrent = Torrent::new(torrent_info);
     torrent.connect_to_peer("127.0.0.1:51413".parse()?);
     while !torrent.completed() {
         let stats = torrent.network_stats();

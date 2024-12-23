@@ -517,6 +517,12 @@ impl FromValue for String {
     }
 }
 
+impl FromValue for u32 {
+    fn from_value(value: &Value) -> Result<Self> {
+        Ok(value.as_integer()? as u32)
+    }
+}
+
 impl FromValue for u64 {
     fn from_value(value: &Value) -> Result<Self> {
         Ok(value.as_integer()? as u64)
