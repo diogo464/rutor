@@ -2156,7 +2156,8 @@ impl TorrentState {
             match message {
                 Message::Choke => {
                     println!("peer choked");
-                    peer.remote_choke = true
+                    peer.remote_choke = true;
+                    self.peer_cancel_all_chunks(key);
                 }
                 Message::Unchoke => {
                     println!("peer unchoked");
@@ -2486,19 +2487,25 @@ impl TorrentState {
         }
     }
 
-    fn disconnect_peer(&mut self, key: PeerKey) {
-        let peer = match self.peers.remove(key) {
-            Some(peer) => peer,
-            None => return,
-        };
-        let peer_addr = peer.addr;
-        println!("disconnecting peer {peer_addr}");
-
-        for chunk_key in peer.pending_chunks {
+    fn peer_cancel_all_chunks(&mut self, peer_key: PeerKey) {
+        let peer = &mut self.peers[peer_key];
+        for chunk_key in peer.pending_chunks.drain(..) {
             let chunk = &mut self.chunks[chunk_key];
-            assert_eq!(chunk.assigned_peer, Some(key));
+            assert_eq!(chunk.assigned_peer, Some(peer_key));
             self.chunks[chunk_key].assigned_peer = None;
         }
+    }
+
+    fn disconnect_peer(&mut self, peer_key: PeerKey) {
+        if !self.peers.contains_key(peer_key) {
+            return;
+        }
+
+        let peer_addr = self.peers[peer_key].addr;
+        println!("disconnecting peer {peer_addr}");
+
+        self.peer_cancel_all_chunks(peer_key);
+        self.peers.remove(peer_key);
     }
 
     fn peer_with_addr_exists(&self, addr: SocketAddr) -> bool {
