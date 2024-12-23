@@ -1742,7 +1742,7 @@ fn tracker_loop(
         match msg {
             TrackerMsg::Announce(params) => {
                 let response = client.announce(&params)?;
-                sender.send(TorrentMsg::TrackerAnnounce {
+                let _ = sender.send(TorrentMsg::TrackerAnnounce {
                     key,
                     announce: response,
                 });
