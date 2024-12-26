@@ -186,8 +186,17 @@ impl TorrentInfo {
         }
     }
 
-    pub fn piece_index_valid(&self, piece_index: &PieceIdx) -> bool {
+    pub fn piece_index_valid(&self, piece_index: PieceIdx) -> bool {
         piece_index.0 < self.pieces_count()
+    }
+
+    pub fn piece_request_valid(&self, piece_index: PieceIdx, begin: u32, length: u32) -> bool {
+        if !self.piece_index_valid(piece_index) {
+            return false;
+        }
+
+        let piece_length = self.piece_length_from_index(piece_index);
+        begin.saturating_add(length) > piece_length
     }
 
     pub fn piece_hash(&self, piece_index: &PieceIdx) -> Option<&Sha1> {
@@ -1597,6 +1606,7 @@ fn peer_io_writer(
 }
 
 enum DiskIOMsg {
+    ReadPiece { idx: PieceIdx },
     WritePiece { idx: PieceIdx, data: Bytes },
 }
 
@@ -1612,6 +1622,10 @@ impl DiskIO {
         Self { sender }
     }
 
+    pub fn read_piece(&self, idx: PieceIdx) {
+        self.send(DiskIOMsg::ReadPiece { idx });
+    }
+
     pub fn write_piece(&self, idx: PieceIdx, data: Bytes) {
         self.send(DiskIOMsg::WritePiece { idx, data });
     }
@@ -1624,6 +1638,7 @@ impl DiskIO {
 fn disk_io_entry(info: TorrentInfo, receiver: Receiver<DiskIOMsg>, sender: TorrentSender) {
     while let Ok(msg) = receiver.recv() {
         match msg {
+            DiskIOMsg::ReadPiece { idx } => {}
             DiskIOMsg::WritePiece { idx, data } => {
                 for range in info.files_from_piece(idx) {
                     match attempt_write_piece(
@@ -1877,9 +1892,20 @@ enum TorrentMsg {
     ConnectToPeer {
         addr: SocketAddr,
     },
+    ReadPieceSuccess {
+        idx: PieceIdx,
+        data: Bytes,
+    },
+    ReadPieceError {
+        idx: PieceIdx,
+        error: std::io::Error,
+    },
     WritePieceError {
         idx: PieceIdx,
         error: std::io::Error,
+    },
+    ChangeMode {
+        mode: TorrentMode,
     },
     NetworkStats {
         res: Sender<NetworkStats>,
@@ -1896,20 +1922,14 @@ struct FileState {
     length: u64,
 }
 
-#[derive(Debug, Clone)]
-struct PieceFileRange {
-    file: FileKey,
-    file_offset: u64,
-    piece_offset: u32,
-    length: u32,
-}
-
 #[derive(Debug)]
 struct PieceState {
     hash: Sha1,
     length: u32,
     chunks: Vec<ChunkKey>,
-    ranges: Vec<PieceFileRange>,
+
+    /// are we waiting to read this piece from disk
+    disk_requested: bool,
 }
 
 #[derive(Debug)]
@@ -1920,6 +1940,13 @@ struct ChunkState {
     length: u32,
     assigned_peer: Option<PeerKey>,
     data: Option<Bytes>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PeerRequest {
+    piece: PieceIdx,
+    begin: u32,
+    length: u32,
 }
 
 #[derive(Debug)]
@@ -1941,6 +1968,7 @@ struct PeerState {
     /// are we interested in the peer
     local_interested: bool,
     pending_chunks: Vec<ChunkKey>,
+    remote_requests: Vec<PeerRequest>,
 }
 
 #[derive(Debug)]
@@ -1951,9 +1979,19 @@ struct TrackerState {
     status: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TorrentMode {
+    Starting,
+    Checking,
+    Running,
+    Paused,
+    Failed,
+}
+
 #[derive(Debug)]
 struct TorrentState {
     id: PeerId,
+    mode: TorrentMode,
     info: TorrentInfo,
     sender: TorrentSender,
     receiver: TorrentReceiver,
@@ -2001,26 +2039,10 @@ impl TorrentState {
                     hash,
                     length: piece_length,
                     chunks: Default::default(),
-                    ranges: Default::default(),
+                    disk_requested: false,
                 },
             );
             assert_eq!(piece_key.to_index(), index);
-
-            let piece_ranges = {
-                let mut ranges = Vec::default();
-                for range in info.files_from_piece(index) {
-                    let file_key = file_keys[range.file.index()];
-
-                    ranges.push(PieceFileRange {
-                        file: file_key,
-                        file_offset: range.file_start,
-                        piece_offset: range.piece_start,
-                        length: range.chunk_length,
-                    });
-                }
-
-                ranges
-            };
 
             let piece_chunks = {
                 let mut piece_chunks = Vec::with_capacity(num_chunks as usize);
@@ -2040,7 +2062,6 @@ impl TorrentState {
             };
 
             pieces[piece_key].chunks = piece_chunks;
-            pieces[piece_key].ranges = piece_ranges;
         }
 
         let (sender, receiver) = std::sync::mpsc::channel();
@@ -2048,6 +2069,7 @@ impl TorrentState {
         let disk_io = DiskIO::new(info.clone(), sender.clone());
         Self {
             id: Default::default(),
+            mode: TorrentMode::Starting,
             info,
             sender,
             receiver,
@@ -2088,9 +2110,14 @@ impl TorrentState {
             }
             TorrentMsg::TrackerError { key, error } => self.process_tracker_error(key, error),
             TorrentMsg::ConnectToPeer { addr } => self.process_connect_to_peer(addr),
+            TorrentMsg::ReadPieceSuccess { idx, data } => {
+                self.process_read_piece_success(idx, data)
+            }
+            TorrentMsg::ReadPieceError { idx, error } => self.process_read_piece_error(idx, error),
             TorrentMsg::WritePieceError { idx, error } => {
                 self.process_write_piece_error(idx, error)
             }
+            TorrentMsg::ChangeMode { mode } => self.process_change_mode(mode),
             TorrentMsg::NetworkStats { res } => {
                 let stats = self.network_stats.stats();
                 let _ = res.send(stats);
@@ -2107,6 +2134,14 @@ impl TorrentState {
         self.check_peer_interests();
         self.request_chunks();
         self.trackers_announce();
+    }
+
+    fn process_change_mode(&mut self, mode: TorrentMode) {
+        match (self.mode, mode) {
+            (_, TorrentMode::Checking) => {}
+            (_, TorrentMode::Paused) => {}
+        }
+
     }
 
     fn process_peer_handshake(&mut self, key: PeerKey, id: PeerId) {
@@ -2171,21 +2206,13 @@ impl TorrentState {
                     println!("peer not interested");
                     peer.remote_interested = false
                 }
-                Message::Have { index } => {
-                    let piece_key = PieceKey::from_index(index);
-                    if !self.pieces.contains_key(piece_key) {
-                        println!("peer sent Have message with invalid piece index");
-                        self.disconnect_peer(key);
-                        return;
-                    }
-                    peer.bitfield.set_piece(index);
-                }
+                Message::Have { index } => self.process_peer_have(key, index),
                 Message::Bitfield { .. } => unreachable!(),
                 Message::Request {
                     index,
                     begin,
                     length,
-                } => todo!(),
+                } => self.process_peer_request(key, index, begin, length),
                 Message::Piece { index, begin, data } => {
                     let piece_key = PieceKey::from_index(index);
                     if !self.pieces.contains_key(piece_key) {
@@ -2222,9 +2249,61 @@ impl TorrentState {
                     index,
                     begin,
                     length,
-                } => todo!(),
+                } => self.process_peer_cancel(key, index, begin, length),
             }
         }
+    }
+
+    fn process_peer_have(&mut self, peer_key: PeerKey, piece_idx: PieceIdx) {
+        let peer = &mut self.peers[peer_key];
+        let piece_key = PieceKey::from_index(piece_idx);
+        if !self.pieces.contains_key(piece_key) {
+            println!("peer sent Have message with invalid piece index");
+            self.disconnect_peer(peer_key);
+            return;
+        }
+        peer.bitfield.set_piece(piece_idx);
+    }
+
+    fn process_peer_request(
+        &mut self,
+        peer_key: PeerKey,
+        piece_idx: PieceIdx,
+        begin: u32,
+        length: u32,
+    ) {
+        if !self.info.piece_request_valid(piece_idx, begin, length) {
+            self.disconnect_peer(peer_key);
+            return;
+        }
+        let request = PeerRequest {
+            piece: piece_idx,
+            begin,
+            length,
+        };
+        let peer = &mut self.peers[peer_key];
+        peer.remote_requests.push(request);
+        self.disk_request_piece(piece_idx);
+    }
+
+    fn process_peer_cancel(
+        &mut self,
+        peer_key: PeerKey,
+        piece_idx: PieceIdx,
+        begin: u32,
+        length: u32,
+    ) {
+        if !self.info.piece_request_valid(piece_idx, begin, length) {
+            self.disconnect_peer(peer_key);
+            return;
+        }
+        let request = PeerRequest {
+            piece: piece_idx,
+            begin,
+            length,
+        };
+        let peer = &mut self.peers[peer_key];
+        peer.remote_requests.retain(|r| r != &request);
     }
 
     fn process_peer_error(&mut self, key: PeerKey, error: std::io::Error) {
@@ -2277,8 +2356,14 @@ impl TorrentState {
 
     fn process_connect_to_peer(&mut self, addr: SocketAddr) {
         println!("received request to connect to peer at {addr}");
+        if self.mode != TorrentMode::Running {
+            println!("can't add peer while mode is not running");
+            return;
+        }
+
         if self.peer_with_addr_exists(addr) {
-            println!("peer with addr {addr} already exists, no connecting");
+            println!("peer with addr {addr} already exists, not connecting");
+            return;
         }
 
         self.peers.insert_with_key(|key| {
@@ -2301,6 +2386,7 @@ impl TorrentState {
                 remote_interested: false,
                 local_interested: false,
                 pending_chunks: Default::default(),
+                remote_requests: Default::default(),
             }
         });
     }
@@ -2326,6 +2412,34 @@ impl TorrentState {
         self.network_stats.add_download(data_len);
         self.attempt_finalize_piece(piece_key);
         self.request_chunks_from(peer_key);
+    }
+
+    fn process_read_piece_success(&mut self, piece_idx: PieceIdx, data: Bytes) {
+        let mut requests = Vec::default();
+        for peer in self.peers.values_mut() {
+            peer.remote_requests.retain(|r| {
+                if r.piece == piece_idx {
+                    requests.push(*r);
+                    false
+                } else {
+                    true
+                }
+            });
+
+            for request in requests.drain(..) {
+                let message = Message::Piece {
+                    index: piece_idx,
+                    begin: request.begin,
+                    data: data
+                        .slice(request.begin as usize..(request.begin + request.length) as usize),
+                };
+                peer.io.send(message);
+            }
+        }
+    }
+
+    fn process_read_piece_error(&mut self, piece_idx: PieceIdx, error: std::io::Error) {
+        println!("TODO: FAILED TO READ PIECE FROM DISK {piece_idx} {error}");
     }
 
     fn process_write_piece_error(&mut self, piece_idx: PieceIdx, error: std::io::Error) {
@@ -2391,6 +2505,15 @@ impl TorrentState {
         let tracker = &mut self.trackers[key];
         tracker.io.announce(params);
         tracker.next_announce = Instant::now() + Duration::from_secs(300);
+    }
+
+    fn disk_request_piece(&mut self, piece_idx: PieceIdx) {
+        let piece_key = PieceKey::from_index(piece_idx);
+        let piece = &mut self.pieces[piece_key];
+        if !piece.disk_requested {
+            piece.disk_requested = true;
+            self.disk_io.read_piece(piece_idx);
+        }
     }
 
     fn attempt_finalize_piece(&mut self, piece_key: PieceKey) {
