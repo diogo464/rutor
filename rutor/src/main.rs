@@ -199,8 +199,8 @@ impl TorrentInfo {
         begin.saturating_add(length) > piece_length
     }
 
-    pub fn piece_hash(&self, piece_index: &PieceIdx) -> Option<&Sha1> {
-        self.0.pieces.get(piece_index.0 as usize)
+    pub fn piece_hash(&self, piece_index: PieceIdx) -> Option<Sha1> {
+        self.0.pieces.get(piece_index.0 as usize).copied()
     }
 
     // returns the piece that contains that byte offset
@@ -1055,6 +1055,18 @@ impl PieceBitfield {
         self.size = new_size;
     }
 
+    pub fn num_set(&self) -> u32 {
+        self.pieces().count() as u32
+    }
+
+    pub fn num_unset(&self) -> u32 {
+        self.missing_pieces().count() as u32
+    }
+
+    pub fn clear(&mut self) {
+        self.data.iter_mut().for_each(|v| *v = 0);
+    }
+
     pub fn complete(&self) -> bool {
         for i in 0..self.size {
             if !self.has_piece(PieceIdx::from(i)) {
@@ -1638,7 +1650,14 @@ impl DiskIO {
 fn disk_io_entry(info: TorrentInfo, receiver: Receiver<DiskIOMsg>, sender: TorrentSender) {
     while let Ok(msg) = receiver.recv() {
         match msg {
-            DiskIOMsg::ReadPiece { idx } => {}
+            DiskIOMsg::ReadPiece { idx } => match attempt_read_piece(&info, idx) {
+                Ok(data) => {
+                    let _ = sender.send(TorrentMsg::ReadPieceSuccess { idx, data });
+                }
+                Err(error) => {
+                    let _ = sender.send(TorrentMsg::ReadPieceError { idx, error });
+                }
+            },
             DiskIOMsg::WritePiece { idx, data } => {
                 for range in info.files_from_piece(idx) {
                     match attempt_write_piece(
@@ -1655,6 +1674,25 @@ fn disk_io_entry(info: TorrentInfo, receiver: Receiver<DiskIOMsg>, sender: Torre
             }
         }
     }
+}
+
+fn attempt_read_piece(info: &TorrentInfo, piece_idx: PieceIdx) -> std::io::Result<Bytes> {
+    let piece_len = info.piece_length_from_index(piece_idx);
+
+    let mut data = BytesMut::new();
+    data.resize(piece_len as usize, 0);
+
+    for range in info.files_from_piece(piece_idx) {
+        let mut file = std::fs::OpenOptions::new()
+            .create(false)
+            .write(false)
+            .read(true)
+            .open(&range.file.path)?;
+        file.seek(std::io::SeekFrom::Start(range.file_start))?;
+        file.read_exact(&mut data[range.piece_range()])?;
+    }
+
+    Ok(data.freeze())
 }
 
 fn attempt_write_piece(path: &Path, offset: u64, data: &[u8]) -> std::io::Result<()> {
@@ -1998,6 +2036,8 @@ struct TorrentState {
     disk_io: DiskIO,
     queue: VecDeque<TorrentMsg>,
     bitfield: PieceBitfield,
+    /// track which pieces we have read (successfully or not) while checking the torrent
+    checking_bitfield: PieceBitfield,
     files: SlotMap<FileKey, FileState>,
     pieces: SecondaryMap<PieceKey, PieceState>,
     chunks: SlotMap<ChunkKey, ChunkState>,
@@ -2066,6 +2106,7 @@ impl TorrentState {
 
         let (sender, receiver) = std::sync::mpsc::channel();
         let bitfield = PieceBitfield::with_size(info.pieces_count());
+        let checking_bitfield = PieceBitfield::with_size(info.pieces_count());
         let disk_io = DiskIO::new(info.clone(), sender.clone());
         Self {
             id: Default::default(),
@@ -2076,6 +2117,7 @@ impl TorrentState {
             disk_io,
             queue: Default::default(),
             bitfield,
+            checking_bitfield,
             files,
             pieces,
             chunks,
@@ -2100,6 +2142,17 @@ impl TorrentState {
         }
     }
 
+    pub fn check(&mut self) {
+        self.mode = TorrentMode::Checking;
+        self.disconnect_peers();
+        self.bitfield.clear();
+        println!("started checking torrent");
+
+        for piece_idx in self.info.piece_indices() {
+            self.disk_io.read_piece(piece_idx);
+        }
+    }
+
     pub fn process_message(&mut self, message: TorrentMsg) {
         match message {
             TorrentMsg::PeerHandshake { key, id } => self.process_peer_handshake(key, id),
@@ -2117,7 +2170,7 @@ impl TorrentState {
             TorrentMsg::WritePieceError { idx, error } => {
                 self.process_write_piece_error(idx, error)
             }
-            TorrentMsg::ChangeMode { mode } => self.process_change_mode(mode),
+            TorrentMsg::ChangeMode { mode } => todo!(),
             TorrentMsg::NetworkStats { res } => {
                 let stats = self.network_stats.stats();
                 let _ = res.send(stats);
@@ -2131,17 +2184,11 @@ impl TorrentState {
 
     pub fn process_tick(&mut self) {
         //println!("tick");
-        self.check_peer_interests();
-        self.request_chunks();
-        self.trackers_announce();
-    }
-
-    fn process_change_mode(&mut self, mode: TorrentMode) {
-        match (self.mode, mode) {
-            (_, TorrentMode::Checking) => {}
-            (_, TorrentMode::Paused) => {}
+        if self.mode == TorrentMode::Running {
+            self.check_peer_interests();
+            self.request_chunks();
+            self.trackers_announce();
         }
-
     }
 
     fn process_peer_handshake(&mut self, key: PeerKey, id: PeerId) {
@@ -2415,6 +2462,55 @@ impl TorrentState {
     }
 
     fn process_read_piece_success(&mut self, piece_idx: PieceIdx, data: Bytes) {
+        if self.mode == TorrentMode::Checking {
+            self.checking_piece_read_success(piece_idx, data);
+        } else {
+            self.peer_serve_pending_requests_for_piece(piece_idx, data);
+        }
+    }
+
+    fn process_read_piece_error(&mut self, piece_idx: PieceIdx, error: std::io::Error) {
+        if self.mode == TorrentMode::Checking {
+            self.checking_piece_read_failure(piece_idx, error);
+        } else {
+            println!("TODO: FAILED TO READ PIECE FROM DISK {piece_idx} {error}");
+        }
+    }
+
+    fn process_write_piece_error(&mut self, piece_idx: PieceIdx, error: std::io::Error) {
+        println!("failed to write piece {piece_idx}: {error}");
+        self.bitfield.unset_piece(piece_idx);
+    }
+
+    fn checking_piece_read_success(&mut self, piece_idx: PieceIdx, data: Bytes) {
+        self.checking_bitfield.set_piece(piece_idx);
+        let hash = Sha1::hash(&data);
+        let expected_hash = self.info.piece_hash(piece_idx).expect("piece must exist");
+        if hash == expected_hash {
+            self.bitfield.set_piece(piece_idx);
+        }
+        self.checking_try_finish();
+    }
+
+    fn checking_piece_read_failure(&mut self, piece_idx: PieceIdx, error: std::io::Error) {
+        self.checking_bitfield.set_piece(piece_idx);
+        self.checking_try_finish();
+    }
+
+    fn checking_try_finish(&mut self) {
+        println!(
+            "checking: {}/{}",
+            self.checking_bitfield.num_set(),
+            self.checking_bitfield.len()
+        );
+        if !self.checking_bitfield.complete() {
+            return;
+        }
+        println!("done checking torrent");
+        self.mode = TorrentMode::Running;
+    }
+
+    fn peer_serve_pending_requests_for_piece(&mut self, piece_idx: PieceIdx, data: Bytes) {
         let mut requests = Vec::default();
         for peer in self.peers.values_mut() {
             peer.remote_requests.retain(|r| {
@@ -2436,15 +2532,6 @@ impl TorrentState {
                 peer.io.send(message);
             }
         }
-    }
-
-    fn process_read_piece_error(&mut self, piece_idx: PieceIdx, error: std::io::Error) {
-        println!("TODO: FAILED TO READ PIECE FROM DISK {piece_idx} {error}");
-    }
-
-    fn process_write_piece_error(&mut self, piece_idx: PieceIdx, error: std::io::Error) {
-        println!("failed to write piece {piece_idx}: {error}");
-        self.bitfield.unset_piece(piece_idx);
     }
 
     fn trackers_add_default(&mut self) {
@@ -2619,6 +2706,13 @@ impl TorrentState {
         }
     }
 
+    fn disconnect_peers(&mut self) {
+        let keys = self.peers.keys().collect::<Vec<_>>();
+        for key in keys {
+            self.disconnect_peer(key);
+        }
+    }
+
     fn disconnect_peer(&mut self, peer_key: PeerKey) {
         if !self.peers.contains_key(peer_key) {
             return;
@@ -2688,6 +2782,7 @@ impl Torrent {
 
 fn torrent_entry(mut state: TorrentState) {
     state.trackers_add_default();
+    state.check();
     loop {
         let result = state.receiver.recv_timeout(Duration::from_secs(1));
         match result {
