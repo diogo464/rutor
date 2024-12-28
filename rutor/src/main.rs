@@ -1769,7 +1769,8 @@ fn attempt_write_piece(path: &Path, offset: u64, data: &[u8]) -> std::io::Result
     }
     let mut file = std::fs::OpenOptions::new()
         .create(true)
-        .append(true)
+        .truncate(false)
+        .write(true)
         .open(path)?;
     file.seek(std::io::SeekFrom::Start(offset))?;
     file.write_all(data)?;
@@ -2555,6 +2556,8 @@ impl TorrentState {
         let expected_hash = self.info.piece_hash(piece_idx).expect("piece must exist");
         if hash == expected_hash {
             self.bitfield.set_piece(piece_idx);
+        } else {
+            println!("hash check failed");
         }
         self.checking_try_finish();
     }
