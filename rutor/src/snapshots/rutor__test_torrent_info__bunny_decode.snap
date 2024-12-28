@@ -1,0 +1,6 @@
+---
+source: rutor/src/main.rs
+expression: info.name()
+snapshot_kind: text
+---
+Big Buck Bunny

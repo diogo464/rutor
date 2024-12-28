@@ -1,0 +1,6 @@
+---
+source: rutor/src/main.rs
+expression: info.announce()
+snapshot_kind: text
+---
+udp://tracker.leechers-paradise.org:6969

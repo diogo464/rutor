@@ -1,0 +1,6 @@
+---
+source: rutor/src/main.rs
+expression: info.total_size()
+snapshot_kind: text
+---
+276445467

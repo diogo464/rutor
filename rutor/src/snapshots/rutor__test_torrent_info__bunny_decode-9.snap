@@ -1,0 +1,6 @@
+---
+source: rutor/src/main.rs
+expression: file.path.display()
+snapshot_kind: text
+---
+Big Buck Bunny.mp4

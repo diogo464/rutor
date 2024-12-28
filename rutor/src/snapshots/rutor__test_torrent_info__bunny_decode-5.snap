@@ -1,0 +1,6 @@
+---
+source: rutor/src/main.rs
+expression: info.pieces_count()
+snapshot_kind: text
+---
+1055

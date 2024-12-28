@@ -1,0 +1,6 @@
+---
+source: rutor/src/main.rs
+expression: info.info_hash()
+snapshot_kind: text
+---
+dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c

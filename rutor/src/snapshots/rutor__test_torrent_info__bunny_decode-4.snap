@@ -1,0 +1,6 @@
+---
+source: rutor/src/main.rs
+expression: info.piece_length()
+snapshot_kind: text
+---
+262144

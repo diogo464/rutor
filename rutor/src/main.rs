@@ -38,6 +38,15 @@ impl std::fmt::Debug for Sha1 {
     }
 }
 
+impl std::fmt::Display for Sha1 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for v in self.0 {
+            write!(f, "{:x}", v)?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PieceIdx(u32);
 
@@ -335,6 +344,64 @@ impl<'a> Iterator for TorrentFileRangeIterator<'a> {
             piece_start,
             chunk_length,
         })
+    }
+}
+
+#[cfg(test)]
+mod test_torrent_info {
+    use super::*;
+
+    const BUNNY_DATA: &'static [u8] = include_bytes!("../bunny.torrent");
+
+    #[test]
+    fn bunny_decode() {
+        let info = TorrentInfo::decode(&BUNNY_DATA).unwrap();
+        insta::assert_yaml_snapshot!(info.name(), @"Big Buck Bunny");
+        insta::assert_yaml_snapshot!(info.announce(), @r#""udp://tracker.leechers-paradise.org:6969""#);
+        insta::assert_yaml_snapshot!(info.info_hash().to_string(), @"dd8255ecdc7ca55fb0bbf81323d87062db1f6d1c");
+        insta::assert_yaml_snapshot!(info.piece_length(), @"262144");
+        insta::assert_yaml_snapshot!(info.pieces_count(), @"1055");
+        insta::assert_yaml_snapshot!(info.total_size(), @"276445467");
+        insta::assert_yaml_snapshot!(info.files().len(), @"3");
+
+        let file_0 = &info.files()[0];
+        insta::assert_yaml_snapshot!(file_0.path(), @"Big Buck Bunny.en.srt");
+        insta::assert_yaml_snapshot!(file_0.index, @"0");
+        insta::assert_yaml_snapshot!(file_0.start, @"0");
+        insta::assert_yaml_snapshot!(file_0.length, @"140");
+
+        let file_1 = &info.files()[1];
+        insta::assert_yaml_snapshot!(file_1.path(), @"Big Buck Bunny.mp4");
+        insta::assert_yaml_snapshot!(file_1.index, @"1");
+        insta::assert_yaml_snapshot!(file_1.start, @"140");
+        insta::assert_yaml_snapshot!(file_1.length, @"276134947");
+
+        let file_2 = &info.files()[2];
+        insta::assert_yaml_snapshot!(file_2.path(), @"poster.jpg");
+        insta::assert_yaml_snapshot!(file_2.index, @"2");
+        insta::assert_yaml_snapshot!(file_2.start, @"276135087");
+        insta::assert_yaml_snapshot!(file_2.length, @"310380");
+    }
+
+    #[test]
+    fn bunny_piece_0_range() {
+        let info = TorrentInfo::decode(&BUNNY_DATA).unwrap();
+        let ranges = info.files_from_piece(PieceIdx::new(0)).collect::<Vec<_>>();
+        let piece_len = info.piece_length();
+        let file_srt = &info.files()[0];
+        let file_mp4 = &info.files()[1];
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges[0].file.path(), file_srt.path());
+        assert_eq!(ranges[1].file.path(), file_mp4.path());
+
+        assert_eq!(ranges[0].file_start, 0);
+        assert_eq!(ranges[1].file_start, 0);
+
+        assert_eq!(ranges[0].piece_start, 0);
+        assert_eq!(ranges[1].piece_start, file_srt.length as u32);
+
+        assert_eq!(ranges[0].chunk_length, file_srt.length as u32);
+        assert_eq!(ranges[1].chunk_length, piece_len - file_srt.length as u32);
     }
 }
 
