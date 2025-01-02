@@ -1,13 +1,14 @@
 use std::{
     collections::VecDeque,
     io::{BufReader, BufWriter, Cursor, Read, Seek, Write},
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream, ToSocketAddrs, UdpSocket},
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, ToSocketAddrs, UdpSocket},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use bytes::{Bytes, BytesMut};
+use clap::Parser;
 use serde::Serialize;
 use slotmap::{Key as _, SecondaryMap, SlotMap};
 
@@ -1587,6 +1588,27 @@ impl PeerIO {
         Self { sender }
     }
 
+    pub fn accept(
+        key: PeerKey,
+        info: TorrentInfo,
+        peer_id: PeerId,
+        torrent_sender: TorrentSender,
+        stream: TcpStream,
+    ) -> Self {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            peer_io_accept(
+                key,
+                stream,
+                receiver,
+                torrent_sender,
+                peer_id,
+                info.info_hash(),
+            )
+        });
+        Self { sender }
+    }
+
     pub fn send(&self, message: Message) {
         // TODO: log result if it is error
         // we probably don't care if this fails since that means the threads are exiting and a peer
@@ -1620,6 +1642,53 @@ fn peer_io_connect(
     }
 
     let (stream, remote_peer_id) = match try_connect(addr, peer_id, info_hash) {
+        Ok((stream, handshake)) => (stream, handshake),
+        Err(error) => {
+            let _ = sender.send(TorrentMsg::PeerError { key, error });
+            return;
+        }
+    };
+
+    let send_result = sender.send(TorrentMsg::PeerHandshake {
+        key,
+        id: remote_peer_id,
+    });
+    if send_result.is_err() {
+        return;
+    }
+
+    let stream = Arc::new(stream);
+    std::thread::spawn({
+        let stream = stream.clone();
+        let sender = sender.clone();
+        move || peer_io_writer(key, receiver, sender, stream)
+    });
+    peer_io_reader(key, sender, stream);
+}
+
+fn peer_io_accept(
+    key: PeerKey,
+    stream: TcpStream,
+    receiver: Receiver<Message>,
+    sender: TorrentSender,
+    peer_id: PeerId,
+    info_hash: Sha1,
+) {
+    fn try_accept(
+        mut stream: TcpStream,
+        peer_id: PeerId,
+        info_hash: Sha1,
+    ) -> std::io::Result<(TcpStream, PeerId)> {
+        stream.set_write_timeout(Some(Duration::from_secs(8)))?;
+        let handshake = read_handshake(&mut stream)?;
+        if handshake.info_hash != info_hash {
+            return Err(std::io::Error::other("handshake info hash missmatch"));
+        }
+        write_handshake(&mut stream, &Handshake { info_hash, peer_id })?;
+        Ok((stream, handshake.peer_id))
+    }
+
+    let (stream, remote_peer_id) = match try_accept(stream, peer_id, info_hash) {
         Ok((stream, handshake)) => (stream, handshake),
         Err(error) => {
             let _ = sender.send(TorrentMsg::PeerError { key, error });
@@ -1873,6 +1942,32 @@ fn tracker_loop(
     Ok(())
 }
 
+fn listener_start(listen_addr: SocketAddr, sender: TorrentSender) -> std::io::Result<()> {
+    println!("starting listener at {listen_addr}");
+    let listener = TcpListener::bind(listen_addr)?;
+    std::thread::spawn(move || listener_loop(listener, sender));
+    Ok(())
+}
+
+fn listener_loop(listener: TcpListener, sender: TorrentSender) {
+    loop {
+        match listener.accept() {
+            Ok((stream, addr)) => {
+                println!("accepting connection from {addr}");
+                if sender
+                    .send(TorrentMsg::PeerConnected { addr, stream })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Err(error) => {
+                println!("failed to accept peer: {error}");
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct NetworkStats {
     pub download: u64,
@@ -1983,6 +2078,10 @@ enum TorrentMsg {
         key: PeerKey,
         message: Message,
     },
+    PeerConnected {
+        addr: SocketAddr,
+        stream: TcpStream,
+    },
     PeerError {
         key: PeerKey,
         error: std::io::Error,
@@ -2077,6 +2176,25 @@ struct PeerState {
     remote_requests: Vec<PeerRequest>,
 }
 
+impl PeerState {
+    pub fn new(io: PeerIO, addr: SocketAddr) -> Self {
+        Self {
+            id: Default::default(),
+            io,
+            addr,
+            handshake_received: false,
+            bitfield_received: false,
+            bitfield: Default::default(),
+            remote_choke: true,
+            local_choke: true,
+            remote_interested: false,
+            local_interested: false,
+            pending_chunks: Default::default(),
+            remote_requests: Default::default(),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct TrackerState {
     url: String,
@@ -2098,6 +2216,7 @@ enum TorrentMode {
 struct TorrentState {
     id: PeerId,
     mode: TorrentMode,
+    config: TorrentConfig,
     info: TorrentInfo,
     sender: TorrentSender,
     receiver: TorrentReceiver,
@@ -2116,7 +2235,7 @@ struct TorrentState {
 }
 
 impl TorrentState {
-    pub fn from_info(info: TorrentInfo) -> Self {
+    pub fn new(info: TorrentInfo, config: TorrentConfig) -> Self {
         let mut pieces = SecondaryMap::<PieceKey, PieceState>::default();
         let mut chunks = SlotMap::<ChunkKey, ChunkState>::default();
         let mut files = SlotMap::<FileKey, FileState>::default();
@@ -2179,6 +2298,7 @@ impl TorrentState {
         Self {
             id: Default::default(),
             mode: TorrentMode::Starting,
+            config,
             info,
             sender,
             receiver,
@@ -2225,6 +2345,7 @@ impl TorrentState {
         match message {
             TorrentMsg::PeerHandshake { key, id } => self.process_peer_handshake(key, id),
             TorrentMsg::PeerMessage { key, message } => self.process_peer_message(key, message),
+            TorrentMsg::PeerConnected { addr, stream } => self.process_peer_connected(addr, stream),
             TorrentMsg::PeerError { key, error } => self.process_peer_error(key, error),
             TorrentMsg::TrackerAnnounce { key, announce } => {
                 self.process_tracker_announce(key, announce)
@@ -2255,7 +2376,10 @@ impl TorrentState {
         if self.mode == TorrentMode::Running {
             self.check_peer_interests();
             self.request_chunks();
-            self.trackers_announce();
+
+            if self.config.use_trackers {
+                self.trackers_announce();
+            }
         }
     }
 
@@ -2367,6 +2491,22 @@ impl TorrentState {
                 } => self.process_peer_cancel(key, index, begin, length),
             }
         }
+    }
+
+    fn process_peer_connected(&mut self, addr: SocketAddr, stream: TcpStream) {
+        if self.peer_with_addr_exists(addr) {
+            // TODO: log warn
+            println!("peer with same addr is already connected: {addr}");
+            return;
+        }
+
+        let info = self.info.clone();
+        let sender = self.sender.clone();
+        let peer_id = self.id;
+        self.peers.insert_with_key(move |key| {
+            let peer_io = PeerIO::accept(key, info, peer_id, sender, stream);
+            PeerState::new(peer_io, addr)
+        });
     }
 
     fn process_peer_have(&mut self, peer_key: PeerKey, piece_idx: PieceIdx) {
@@ -2489,20 +2629,7 @@ impl TorrentState {
                 self.id,
                 self.info.info_hash(),
             );
-            PeerState {
-                id: Default::default(),
-                io: peer_io,
-                addr,
-                handshake_received: false,
-                bitfield_received: false,
-                bitfield: Default::default(),
-                remote_choke: true,
-                local_choke: true,
-                remote_interested: false,
-                local_interested: false,
-                pending_chunks: Default::default(),
-                remote_requests: Default::default(),
-            }
+            PeerState::new(peer_io, addr)
         });
     }
 
@@ -2808,6 +2935,21 @@ fn request_message_from_chunk(chunk: &ChunkState) -> Message {
     }
 }
 
+#[derive(Debug)]
+struct TorrentConfig {
+    use_trackers: bool,
+    listen: Option<SocketAddr>,
+}
+
+impl Default for TorrentConfig {
+    fn default() -> Self {
+        Self {
+            use_trackers: true,
+            listen: None,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Torrent {
     sender: TorrentSender,
@@ -2815,9 +2957,18 @@ struct Torrent {
 
 impl Torrent {
     pub fn new(info: TorrentInfo) -> Self {
-        let state = TorrentState::from_info(info);
+        Self::new_with(info, Default::default())
+    }
+
+    pub fn new_with(info: TorrentInfo, config: TorrentConfig) -> Self {
+        let listen_addr = config.listen;
+        let state = TorrentState::new(info, config);
         let sender = state.sender.clone();
         std::thread::spawn(move || torrent_entry(state));
+        if let Some(addr) = listen_addr {
+            let sender = sender.clone();
+            listener_start(addr, sender).unwrap();
+        }
         Self { sender }
     }
 
@@ -2930,54 +3081,43 @@ fn extract_udp_tracker_addresses(info: &Metainfo) -> Vec<SocketAddr> {
     addrs
 }
 
+#[derive(Debug, Parser)]
+struct Args {
+    #[clap(default_value = "bunny.torrent")]
+    torrent: String,
+
+    #[clap(long)]
+    peers: Vec<SocketAddr>,
+
+    #[clap(long)]
+    listen: Option<SocketAddr>,
+
+    #[clap(long)]
+    no_trackers: bool,
+
+    #[clap(long)]
+    seed: bool,
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let content = std::fs::read("bunny.torrent").unwrap();
+    let args = Args::parse();
+    let content = std::fs::read(&args.torrent).unwrap();
     let torrent_info = TorrentInfo::decode(&content)?;
     println!("{torrent_info:#?}");
-    //return Ok(());
-
-    // println!("{:#?}", metainfo.announce);
-    // println!("{:#?}", metainfo.announce_list);
-    // println!("{:#?}", extract_udp_tracker_addresses(&metainfo));
-    // let addrs = extract_udp_tracker_addresses(&metainfo);
-    //
-    // let mut client = TrackerUdpClient::new(addrs[2])?;
-    // let announce = client.announce(&AnnounceParams {
-    //     info_hash: metainfo.info_hash,
-    //     peer_id: Default::default(),
-    //     downloaded: 0,
-    //     left: metainfo.info.length,
-    //     uploaded: 0,
-    //     event: Event::Started,
-    //     ip_address: Default::default(),
-    //     num_want: Default::default(),
-    //     port: Default::default(),
-    // })?;
-    // println!("{announce:#?}");
-    //
-    // return Ok(());
-
-    // let torrent_state = TorrentState::from_metainfo(metainfo.clone());
-    // for (_file_key, file) in torrent_state.files.iter() {
-    //     println!("{:?}", file.path);
-    //     println!("\tlength = {}", file.length);
-    // }
-    // println!();
-    // for (piece_key, piece) in torrent_state.pieces.iter() {
-    //     println!("piece {}", piece_key.to_index());
-    //     for range in piece.ranges.iter() {
-    //         let file = &torrent_state.files[range.file];
-    //         println!(
-    //             "\toffset = {} length = {} file = {:?}",
-    //             range.offset, range.length, file.path
-    //         );
-    //     }
-    // }
-    // return Ok(());
-
-    let torrent = Torrent::new(torrent_info);
-    torrent.connect_to_peer("127.0.0.1:51413".parse()?);
-    while !torrent.completed() {
+    let torrent = Torrent::new_with(
+        torrent_info,
+        TorrentConfig {
+            use_trackers: !args.no_trackers,
+            listen: args.listen,
+            ..Default::default()
+        },
+    );
+    //torrent.connect_to_peer("127.0.0.1:51413".parse()?);
+    std::thread::sleep(Duration::from_secs(2));
+    for peer in args.peers {
+        torrent.connect_to_peer(peer);
+    }
+    while !torrent.completed() || args.seed {
         let stats = torrent.network_stats();
         println!(
             "Download: {}\tUpload: {}\t - {}",
