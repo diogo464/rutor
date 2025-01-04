@@ -1099,6 +1099,10 @@ impl PieceBitfield {
         Self { data, size }
     }
 
+    pub fn into_vec(self) -> Vec<u8> {
+        self.data
+    }
+
     pub fn has_piece(&self, index: PieceIdx) -> bool {
         let (byte_index, bit_index) = self.get_indices(index.0);
         (self.data[byte_index] & (1 << bit_index)) > 0
@@ -2503,8 +2507,12 @@ impl TorrentState {
         let info = self.info.clone();
         let sender = self.sender.clone();
         let peer_id = self.id;
+        let bitfield = self.bitfield.clone();
         self.peers.insert_with_key(move |key| {
             let peer_io = PeerIO::accept(key, info, peer_id, sender, stream);
+            peer_io.send(Message::Bitfield {
+                bitfield: bitfield.into_vec(),
+            });
             PeerState::new(peer_io, addr)
         });
     }
