@@ -1524,8 +1524,9 @@ fn write_message<W: Write>(mut writer: W, message: &Message) -> std::io::Result<
             Ok(())
         }
         Message::Piece { index, begin, data } => {
-            let len = 8 + data.len() as u32;
+            let len = 9 + data.len() as u32;
             write_u32(&mut writer, len)?;
+            write_message_kind(&mut writer, MessageKind::Piece)?;
             write_u32(&mut writer, u32::from(*index))?;
             write_u32(&mut writer, *begin)?;
             writer.write_all(&data)?;
@@ -1618,6 +1619,7 @@ impl PeerIO {
         // we probably don't care if this fails since that means the threads are exiting and a peer
         // failure message has already been queued. It should never be the case that this fails but
         // a failure message is not queued.
+        println!("sending {message:?}");
         let _ = self.sender.send(message);
     }
 }
@@ -2443,11 +2445,19 @@ impl TorrentState {
                 }
                 Message::Interested => {
                     println!("peer interested");
-                    peer.remote_interested = true
+                    peer.remote_interested = true;
+                    if peer.local_choke {
+                        peer.local_choke = false;
+                        peer.io.send(Message::Unchoke);
+                    }
                 }
                 Message::NotInterested => {
                     println!("peer not interested");
-                    peer.remote_interested = false
+                    peer.remote_interested = false;
+                    if !peer.local_choke {
+                        peer.local_choke = true;
+                        peer.io.send(Message::Choke);
+                    }
                 }
                 Message::Have { index } => self.process_peer_have(key, index),
                 Message::Bitfield { .. } => unreachable!(),
@@ -2536,6 +2546,7 @@ impl TorrentState {
         length: u32,
     ) {
         if !self.info.piece_request_valid(piece_idx, begin, length) {
+            println!("peer sent invalid piece request");
             self.disconnect_peer(peer_key);
             return;
         }
@@ -2665,6 +2676,10 @@ impl TorrentState {
     }
 
     fn process_read_piece_success(&mut self, piece_idx: PieceIdx, data: Bytes) {
+        let piece_key = PieceKey::from_index(piece_idx);
+        self.pieces[piece_key].disk_requested = false;
+
+        println!("received piece {piece_idx} from disk");
         if self.mode == TorrentMode::Checking {
             self.checking_piece_read_success(piece_idx, data);
         } else {
@@ -2673,6 +2688,9 @@ impl TorrentState {
     }
 
     fn process_read_piece_error(&mut self, piece_idx: PieceIdx, error: std::io::Error) {
+        let piece_key = PieceKey::from_index(piece_idx);
+        self.pieces[piece_key].disk_requested = false;
+
         if self.mode == TorrentMode::Checking {
             self.checking_piece_read_failure(piece_idx, error);
         } else {
@@ -2698,6 +2716,7 @@ impl TorrentState {
     }
 
     fn checking_piece_read_failure(&mut self, piece_idx: PieceIdx, error: std::io::Error) {
+        println!("checking piece {piece_idx} failed: {error}");
         self.checking_bitfield.set_piece(piece_idx);
         self.checking_try_finish();
     }
@@ -2716,6 +2735,7 @@ impl TorrentState {
     }
 
     fn peer_serve_pending_requests_for_piece(&mut self, piece_idx: PieceIdx, data: Bytes) {
+        println!("serving peer requests for piece {piece_idx}");
         let mut requests = Vec::default();
         for peer in self.peers.values_mut() {
             peer.remote_requests.retain(|r| {
@@ -2800,6 +2820,7 @@ impl TorrentState {
     }
 
     fn disk_request_piece(&mut self, piece_idx: PieceIdx) {
+        println!("requesting piece {piece_idx} from disk");
         let piece_key = PieceKey::from_index(piece_idx);
         let piece = &mut self.pieces[piece_key];
         if !piece.disk_requested {
