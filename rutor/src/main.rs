@@ -206,7 +206,7 @@ impl TorrentInfo {
         }
 
         let piece_length = self.piece_length_from_index(piece_index);
-        begin.saturating_add(length) > piece_length
+        begin.saturating_add(length) <= piece_length
     }
 
     pub fn piece_hash(&self, piece_index: PieceIdx) -> Option<Sha1> {
