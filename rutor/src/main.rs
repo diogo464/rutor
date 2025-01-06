@@ -9,8 +9,25 @@ use std::{
 
 use bytes::{Bytes, BytesMut};
 use clap::Parser;
+use color_eyre::Result;
+use ratatui::{
+    crossterm::event,
+    layout::{Constraint, Layout, Rect},
+    style::{Color, Style, Stylize as _},
+    symbols,
+    text::Line,
+    widgets::{Block, Borders, LineGauge, Padding, Row, Table},
+    DefaultTerminal, Frame,
+};
 use serde::Serialize;
 use slotmap::{Key as _, SecondaryMap, SlotMap};
+use tracing_subscriber::{
+    layer::{Context, SubscriberExt},
+    util::SubscriberInitExt,
+};
+use tui_logger::{
+    LevelFilter, TuiLoggerLevelOutput, TuiLoggerSmartWidget, TuiLoggerWidget, TuiWidgetState,
+};
 
 #[derive(Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Sha1([u8; 20]);
@@ -906,7 +923,7 @@ impl TrackerUdpClient {
 
     pub fn announce(&mut self, params: &AnnounceParams) -> std::io::Result<Announce> {
         let connection_id = self.connect()?;
-        println!("connection id = {connection_id}");
+        //println!("connection id = {connection_id}");
         let request = AnnounceIpv4Request {
             connection_id,
             transaction_id: random_transaction_id(),
@@ -1133,6 +1150,12 @@ impl PieceBitfield {
 
     pub fn num_unset(&self) -> u32 {
         self.missing_pieces().count() as u32
+    }
+
+    pub fn fill(&mut self) {
+        for i in 0..self.size {
+            self.set_piece(PieceIdx::from(i));
+        }
     }
 
     pub fn clear(&mut self) {
@@ -1540,7 +1563,7 @@ impl PeerIO {
         // we probably don't care if this fails since that means the threads are exiting and a peer
         // failure message has already been queued. It should never be the case that this fails but
         // a failure message is not queued.
-        println!("sending {message:?}");
+        //println!("sending {message:?}");
         let _ = self.sender.send(message);
     }
 }
@@ -1870,7 +1893,7 @@ fn tracker_loop(
 }
 
 fn listener_start(listen_addr: SocketAddr, sender: TorrentSender) -> std::io::Result<()> {
-    println!("starting listener at {listen_addr}");
+    //println!("starting listener at {listen_addr}");
     let listener = TcpListener::bind(listen_addr)?;
     std::thread::spawn(move || listener_loop(listener, sender));
     Ok(())
@@ -1880,7 +1903,7 @@ fn listener_loop(listener: TcpListener, sender: TorrentSender) {
     loop {
         match listener.accept() {
             Ok((stream, addr)) => {
-                println!("accepting connection from {addr}");
+                //println!("accepting connection from {addr}");
                 if sender
                     .send(TorrentMsg::PeerConnected { addr, stream })
                     .is_err()
@@ -1889,7 +1912,7 @@ fn listener_loop(listener: TcpListener, sender: TorrentSender) {
                 }
             }
             Err(error) => {
-                println!("failed to accept peer: {error}");
+                //println!("failed to accept peer: {error}");
             }
         }
     }
@@ -2035,6 +2058,9 @@ enum TorrentMsg {
     WritePieceError {
         idx: PieceIdx,
         error: std::io::Error,
+    },
+    View {
+        res: Sender<TorrentView>,
     },
     ChangeMode {
         mode: TorrentMode,
@@ -2261,10 +2287,15 @@ impl TorrentState {
         self.mode = TorrentMode::Checking;
         self.disconnect_peers();
         self.bitfield.clear();
-        println!("started checking torrent");
+        //println!("started checking torrent");
 
-        for piece_idx in self.info.piece_indices() {
-            self.disk_io.read_piece(piece_idx);
+        if self.config.assume_complete {
+            self.mode = TorrentMode::Running;
+            self.bitfield.fill();
+        } else {
+            for piece_idx in self.info.piece_indices() {
+                self.disk_io.read_piece(piece_idx);
+            }
         }
     }
 
@@ -2287,6 +2318,10 @@ impl TorrentState {
                 self.process_write_piece_error(idx, error)
             }
             TorrentMsg::ChangeMode { mode } => todo!(),
+            TorrentMsg::View { res } => {
+                let view = self.view();
+                let _ = res.send(view);
+            }
             TorrentMsg::NetworkStats { res } => {
                 let stats = self.network_stats.stats();
                 let _ = res.send(stats);
@@ -2310,6 +2345,29 @@ impl TorrentState {
         }
     }
 
+    fn view(&self) -> TorrentView {
+        let mut peers = Vec::with_capacity(self.peers.len());
+        for peer in self.peers.values() {
+            peers.push(TorrentViewPeer {
+                id: peer.id,
+                addr: peer.addr,
+            });
+        }
+
+        TorrentView {
+            info: self.info.clone(),
+            peers,
+            progress: (self.bitfield.num_set() as f64) / (self.bitfield.len() as f64),
+            state: match self.mode {
+                TorrentMode::Starting => TorrentViewState::Running,
+                TorrentMode::Checking => TorrentViewState::Checking,
+                TorrentMode::Running => TorrentViewState::Running,
+                TorrentMode::Paused => TorrentViewState::Paused,
+                TorrentMode::Failed => TorrentViewState::Paused,
+            },
+        }
+    }
+
     fn process_peer_handshake(&mut self, key: PeerKey, id: PeerId) {
         let peer = match self.peers.get_mut(key) {
             Some(peer) => peer,
@@ -2321,7 +2379,7 @@ impl TorrentState {
             return;
         }
 
-        println!("received handshake");
+        //println!("received handshake");
         peer.handshake_received = true;
         peer.id = id;
     }
@@ -2333,15 +2391,15 @@ impl TorrentState {
         };
 
         if !peer.handshake_received {
-            println!("received peer message before handshake");
+            //println!("received peer message before handshake");
             self.disconnect_peer(key);
             return;
         }
 
         if let Message::Bitfield { bitfield } = message {
-            println!("received bitfield");
+            //println!("received bitfield");
             if peer.bitfield_received {
-                println!("received duplicate peer bitfield");
+                //println!("received duplicate peer bitfield");
                 self.disconnect_peer(key);
                 return;
             }
@@ -2349,23 +2407,23 @@ impl TorrentState {
             peer.bitfield = PieceBitfield::from_vec(bitfield, self.info.pieces_count());
         } else {
             if !peer.bitfield_received {
-                println!("received peer message before bitfield, assuming empty bitfield");
+                //println!("received peer message before bitfield, assuming empty bitfield");
                 peer.bitfield_received = true;
                 peer.bitfield = PieceBitfield::with_size(self.info.pieces_count());
             }
 
             match message {
                 Message::Choke => {
-                    println!("peer choked");
+                    //println!("peer choked");
                     peer.remote_choke = true;
                     self.peer_cancel_all_chunks(key);
                 }
                 Message::Unchoke => {
-                    println!("peer unchoked");
+                    //println!("peer unchoked");
                     peer.remote_choke = false
                 }
                 Message::Interested => {
-                    println!("peer interested");
+                    //println!("peer interested");
                     peer.remote_interested = true;
                     if peer.local_choke {
                         peer.local_choke = false;
@@ -2373,7 +2431,7 @@ impl TorrentState {
                     }
                 }
                 Message::NotInterested => {
-                    println!("peer not interested");
+                    //println!("peer not interested");
                     peer.remote_interested = false;
                     if !peer.local_choke {
                         peer.local_choke = true;
@@ -2390,7 +2448,7 @@ impl TorrentState {
                 Message::Piece { index, begin, data } => {
                     let piece_key = PieceKey::from_index(index);
                     if !self.pieces.contains_key(piece_key) {
-                        println!("peer sent Piece message with invalid piece index");
+                        //println!("peer sent Piece message with invalid piece index");
                         self.disconnect_peer(key);
                         return;
                     }
@@ -2412,7 +2470,7 @@ impl TorrentState {
                             self.process_received_chunk(key, chunk_key, data);
                         }
                         None => {
-                            println!("received unrequest piece from peer");
+                            //println!("received unrequest piece from peer");
                             // NOTE: don't disconnect here since we might have sent a Cancel
                             // message that the peer did not receive before sending us the piece.
                             return;
@@ -2431,7 +2489,7 @@ impl TorrentState {
     fn process_peer_connected(&mut self, addr: SocketAddr, stream: TcpStream) {
         if self.peer_with_addr_exists(addr) {
             // TODO: log warn
-            println!("peer with same addr is already connected: {addr}");
+            //println!("peer with same addr is already connected: {addr}");
             return;
         }
 
@@ -2452,7 +2510,7 @@ impl TorrentState {
         let peer = &mut self.peers[peer_key];
         let piece_key = PieceKey::from_index(piece_idx);
         if !self.pieces.contains_key(piece_key) {
-            println!("peer sent Have message with invalid piece index");
+            //println!("peer sent Have message with invalid piece index");
             self.disconnect_peer(peer_key);
             return;
         }
@@ -2467,7 +2525,7 @@ impl TorrentState {
         length: u32,
     ) {
         if !self.info.piece_request_valid(piece_idx, begin, length) {
-            println!("peer sent invalid piece request");
+            //println!("peer sent invalid piece request");
             self.disconnect_peer(peer_key);
             return;
         }
@@ -2506,7 +2564,7 @@ impl TorrentState {
             Some(peer) => peer.addr,
             None => return,
         };
-        println!("peer {addr} failed: {error}");
+        //println!("peer {addr} failed: {error}");
         self.disconnect_peer(key);
     }
 
@@ -2529,7 +2587,7 @@ impl TorrentState {
     }
 
     fn process_tracker_address_list(&mut self, mut addrs: Vec<SocketAddr>) {
-        println!("received peer list: {:#?}", addrs);
+        //println!("received peer list: {:#?}", addrs);
         while self.peers.len() < PEER_COUNT_LIMIT {
             let addr = match addrs.pop() {
                 Some(addr) => addr,
@@ -2550,14 +2608,14 @@ impl TorrentState {
     }
 
     fn process_connect_to_peer(&mut self, addr: SocketAddr) {
-        println!("received request to connect to peer at {addr}");
+        //println!("received request to connect to peer at {addr}");
         if self.mode != TorrentMode::Running {
-            println!("can't add peer while mode is not running");
+            //println!("can't add peer while mode is not running");
             return;
         }
 
         if self.peer_with_addr_exists(addr) {
-            println!("peer with addr {addr} already exists, not connecting");
+            //println!("peer with addr {addr} already exists, not connecting");
             return;
         }
 
@@ -2600,7 +2658,7 @@ impl TorrentState {
         let piece_key = PieceKey::from_index(piece_idx);
         self.pieces[piece_key].disk_requested = false;
 
-        println!("received piece {piece_idx} from disk");
+        //println!("received piece {piece_idx} from disk");
         if self.mode == TorrentMode::Checking {
             self.checking_piece_read_success(piece_idx, data);
         } else {
@@ -2620,7 +2678,7 @@ impl TorrentState {
     }
 
     fn process_write_piece_error(&mut self, piece_idx: PieceIdx, error: std::io::Error) {
-        println!("failed to write piece {piece_idx}: {error}");
+        //println!("failed to write piece {piece_idx}: {error}");
         self.bitfield.unset_piece(piece_idx);
     }
 
@@ -2631,13 +2689,13 @@ impl TorrentState {
         if hash == expected_hash {
             self.bitfield.set_piece(piece_idx);
         } else {
-            println!("hash check failed");
+            //println!("hash check failed");
         }
         self.checking_try_finish();
     }
 
     fn checking_piece_read_failure(&mut self, piece_idx: PieceIdx, error: std::io::Error) {
-        println!("checking piece {piece_idx} failed: {error}");
+        //println!("checking piece {piece_idx} failed: {error}");
         self.checking_bitfield.set_piece(piece_idx);
         self.checking_try_finish();
     }
@@ -2656,7 +2714,7 @@ impl TorrentState {
     }
 
     fn peer_serve_pending_requests_for_piece(&mut self, piece_idx: PieceIdx, data: Bytes) {
-        println!("serving peer requests for piece {piece_idx}");
+        //println!("serving peer requests for piece {piece_idx}");
         let mut requests = Vec::default();
         for peer in self.peers.values_mut() {
             peer.remote_requests.retain(|r| {
@@ -2696,7 +2754,7 @@ impl TorrentState {
             return;
         }
 
-        println!("adding tracker {url}");
+        //println!("adding tracker {url}");
         self.trackers.insert_with_key({
             let sender = self.sender.clone();
             move |key| TrackerState {
@@ -2741,7 +2799,7 @@ impl TorrentState {
     }
 
     fn disk_request_piece(&mut self, piece_idx: PieceIdx) {
-        println!("requesting piece {piece_idx} from disk");
+        //println!("requesting piece {piece_idx} from disk");
         let piece_key = PieceKey::from_index(piece_idx);
         let piece = &mut self.pieces[piece_key];
         if !piece.disk_requested {
@@ -2796,7 +2854,7 @@ impl TorrentState {
             let target_interest = peer.bitfield.contains_missing_in(&self.bitfield);
             let current_interest = peer.local_interested;
             if target_interest != current_interest {
-                println!("updating interest {current_interest} -> {target_interest}");
+                //println!("updating interest {current_interest} -> {target_interest}");
                 peer.local_interested = target_interest;
                 if target_interest {
                     peer.io.send(Message::Interested);
@@ -2866,7 +2924,7 @@ impl TorrentState {
         }
 
         let peer_addr = self.peers[peer_key].addr;
-        println!("disconnecting peer {peer_addr}");
+        //println!("disconnecting peer {peer_addr}");
 
         self.peer_cancel_all_chunks(peer_key);
         self.peers.remove(peer_key);
@@ -2889,6 +2947,7 @@ fn request_message_from_chunk(chunk: &ChunkState) -> Message {
 struct TorrentConfig {
     use_trackers: bool,
     listen: Option<SocketAddr>,
+    assume_complete: bool,
 }
 
 impl Default for TorrentConfig {
@@ -2896,6 +2955,7 @@ impl Default for TorrentConfig {
         Self {
             use_trackers: true,
             listen: None,
+            assume_complete: false,
         }
     }
 }
@@ -2938,6 +2998,12 @@ impl Torrent {
         receiver.recv().unwrap()
     }
 
+    pub fn view(&self) -> TorrentView {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        self.send(TorrentMsg::View { res: sender });
+        receiver.recv().unwrap()
+    }
+
     pub fn wait_until_completed(&self) {
         while !self.completed() {
             std::thread::sleep(Duration::from_millis(500));
@@ -2963,6 +3029,26 @@ fn torrent_entry(mut state: TorrentState) {
         }
         state.process();
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TorrentViewState {
+    Paused,
+    Running,
+    Checking,
+}
+
+#[derive(Debug, Clone)]
+pub struct TorrentViewPeer {
+    pub id: PeerId,
+    pub addr: SocketAddr,
+}
+
+pub struct TorrentView {
+    pub info: TorrentInfo,
+    pub peers: Vec<TorrentViewPeer>,
+    pub progress: f64,
+    pub state: TorrentViewState,
 }
 
 pub struct ByteDisplay(u64);
@@ -3047,18 +3133,66 @@ struct Args {
 
     #[clap(long)]
     seed: bool,
+
+    #[clap(long)]
+    assume_complete: bool,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+struct MyLayer<S> {
+    _phantom: std::marker::PhantomData<S>,
+}
+
+impl<S> Default for MyLayer<S> {
+    fn default() -> Self {
+        Self {
+            _phantom: Default::default(),
+        }
+    }
+}
+
+impl<S> tracing_subscriber::Layer<S> for MyLayer<S>
+where
+    S: tracing::Subscriber,
+{
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        id: &tracing::span::Id,
+        ctx: Context<'_, S>,
+    ) {
+        println!("new span");
+    }
+}
+
+fn main() -> Result<()> {
     let args = Args::parse();
+    color_eyre::install().unwrap();
+    let terminal = ratatui::init();
+    //let fmt_layer = tracing_subscriber::fmt::layer().with_target(false);
+    let filter_layer = tracing_subscriber::EnvFilter::try_from_default_env()
+        .or_else(|_| tracing_subscriber::EnvFilter::try_new("info"))
+        .unwrap();
+    tui_logger::init_logger(tui_logger::LevelFilter::Trace);
+    tracing_subscriber::registry()
+        //.with(fmt_layer)
+        .with(tui_logger::tracing_subscriber_layer())
+        .with(filter_layer)
+        .init();
+    let result = run(args, terminal);
+    ratatui::restore();
+    result
+}
+
+fn run(args: Args, mut terminal: DefaultTerminal) -> Result<()> {
     let content = std::fs::read(&args.torrent).unwrap();
     let torrent_info = TorrentInfo::decode(&content)?;
-    println!("{torrent_info:#?}");
+    //println!("{torrent_info:#?}");
     let torrent = Torrent::new_with(
         torrent_info,
         TorrentConfig {
             use_trackers: !args.no_trackers,
             listen: args.listen,
+            assume_complete: args.assume_complete,
             ..Default::default()
         },
     );
@@ -3067,17 +3201,131 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for peer in args.peers {
         torrent.connect_to_peer(peer);
     }
-    while !torrent.completed() || args.seed {
-        let stats = torrent.network_stats();
-        println!(
-            "Download: {}\tUpload: {}\t - {}",
-            ByteRateDisplay(u64::from(stats.download_rate)),
-            ByteRateDisplay(u64::from(stats.upload_rate)),
-            ByteDisplay(u64::from(stats.download))
-        );
+
+    std::thread::spawn(|| loop {
         std::thread::sleep(Duration::from_secs(1));
+        tracing::info!("hello from thread");
+    });
+
+    loop {
+        let view = torrent.view();
+        terminal.draw(move |frame| render(frame, view))?;
+        if event::poll(Duration::from_millis(500))? {
+            if matches!(event::read()?, event::Event::Key(_)) {
+                break;
+            }
+        }
+
+        if torrent.completed() && !args.seed {
+            break;
+        }
     }
     Ok(())
+}
+
+fn render_text_box(frame: &mut Frame, rect: Rect, title: &str, content: impl std::fmt::Display) {
+    let block = Block::new().title(title).borders(Borders::all());
+    let area = block.inner(rect);
+    let text = Line::from(content.to_string());
+    frame.render_widget(block, rect);
+    frame.render_widget(text, area);
+}
+
+fn render_peers_table(frame: &mut Frame, rect: Rect, view: &TorrentView) {
+    let rows = [Row::new(vec!["Cell1", "Cell2", "Cell3"])];
+    // Columns widths are constrained in the same way as Layout...
+    let widths = [
+        Constraint::Length(5),
+        Constraint::Length(5),
+        Constraint::Length(10),
+    ];
+    let table = Table::new(rows, widths)
+        // ...and they can be separated by a fixed spacing.
+        .column_spacing(1)
+        // You can set the style of the entire Table.
+        .style(Style::new().blue())
+        // It has an optional header, which is simply a Row always visible at the top.
+        .header(
+            Row::new(vec!["Col1", "Col2", "Col3"])
+                .style(Style::new().bold())
+                // To add space between the header and the rest of the rows, specify the margin
+                .bottom_margin(1),
+        )
+        // It has an optional footer, which is simply a Row always visible at the bottom.
+        .footer(Row::new(vec!["Updated on Dec 28"]))
+        // As any other widget, a Table can be wrapped in a Block.
+        .block(Block::new().title("Table"))
+        // The selected row, column, cell and its content can also be styled.
+        .row_highlight_style(Style::new().reversed())
+        .column_highlight_style(Style::new().red())
+        .cell_highlight_style(Style::new().blue())
+        // ...and potentially show a symbol in front of the selection.
+        .highlight_symbol(">>");
+
+    let block = Block::new().title("Peers").borders(Borders::all());
+    frame.render_widget(table.block(block), rect);
+}
+
+fn render_progress_bar(frame: &mut Frame, rect: Rect, view: &TorrentView) {
+    let gauge = LineGauge::default()
+        .block(Block::bordered().title("Progress"))
+        .filled_style(Style::new().white().on_black().bold())
+        .line_set(symbols::line::THICK)
+        .ratio(view.progress);
+    frame.render_widget(gauge, rect);
+}
+
+fn render_logs(frame: &mut Frame, rect: Rect) {
+    let logger = TuiLoggerWidget::default()
+        .block(Block::bordered().title("Logs"))
+        .style_error(Style::default().fg(Color::Red))
+        .style_debug(Style::default().fg(Color::Green))
+        .style_warn(Style::default().fg(Color::Yellow))
+        .style_trace(Style::default().fg(Color::Magenta))
+        .style_info(Style::default().fg(Color::Cyan))
+        .output_separator(':')
+        .output_timestamp(Some("%H:%M:%S".to_string()))
+        .output_level(Some(TuiLoggerLevelOutput::Abbreviated))
+        .output_target(true)
+        .output_file(true)
+        .output_line(true)
+        .style(Style::default().fg(Color::White));
+    frame.render_widget(logger, rect);
+}
+
+fn render(frame: &mut Frame, view: TorrentView) {
+    let block = Block::new()
+        .borders(Borders::all())
+        .title("rutor")
+        .padding(Padding::uniform(1));
+    let area = block.inner(frame.area());
+
+    let [top, bottom] =
+        Layout::vertical([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)]).areas(area);
+    let [top_left, top_right] =
+        Layout::horizontal([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)]).areas(top);
+
+    let [tl_name, tl_size, tl_num_files, _, tl_progress] = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Length(3),
+        Constraint::Length(3),
+        Constraint::Fill(1),
+        Constraint::Length(3),
+    ])
+    .areas(top_left);
+
+    frame.render_widget(&block, frame.area());
+    render_text_box(frame, tl_name, "Name", view.info.name());
+    render_text_box(frame, tl_size, "Size", view.info.total_size());
+    render_text_box(
+        frame,
+        tl_num_files,
+        "Number of Files",
+        view.info.files().len(),
+    );
+    render_progress_bar(frame, tl_progress, &view);
+    render_peers_table(frame, top_right, &view);
+    render_logs(frame, bottom);
 }
 
 fn list_tracker_peers() {
