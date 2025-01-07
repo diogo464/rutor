@@ -3305,11 +3305,12 @@ fn render(frame: &mut Frame, view: TorrentView) {
     let [top_left, top_right] =
         Layout::horizontal([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)]).areas(top);
 
-    let [tl_name, tl_size, tl_num_files, _, tl_progress] = Layout::vertical([
+    let [tl_name, tl_size, tl_num_files, _, tl_status, tl_progress] = Layout::vertical([
         Constraint::Length(3),
         Constraint::Length(3),
         Constraint::Length(3),
         Constraint::Fill(1),
+        Constraint::Length(3),
         Constraint::Length(3),
     ])
     .areas(top_left);
@@ -3322,6 +3323,16 @@ fn render(frame: &mut Frame, view: TorrentView) {
         tl_num_files,
         "Number of Files",
         view.info.files().len(),
+    );
+    render_text_box(
+        frame,
+        tl_status,
+        "Status",
+        match view.state {
+            TorrentViewState::Paused => "paused",
+            TorrentViewState::Running => "running",
+            TorrentViewState::Checking => "checking",
+        },
     );
     render_progress_bar(frame, tl_progress, &view);
     render_peers_table(frame, top_right, &view);
