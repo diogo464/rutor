@@ -3138,32 +3138,6 @@ struct Args {
     assume_complete: bool,
 }
 
-struct MyLayer<S> {
-    _phantom: std::marker::PhantomData<S>,
-}
-
-impl<S> Default for MyLayer<S> {
-    fn default() -> Self {
-        Self {
-            _phantom: Default::default(),
-        }
-    }
-}
-
-impl<S> tracing_subscriber::Layer<S> for MyLayer<S>
-where
-    S: tracing::Subscriber,
-{
-    fn on_new_span(
-        &self,
-        attrs: &tracing::span::Attributes<'_>,
-        id: &tracing::span::Id,
-        ctx: Context<'_, S>,
-    ) {
-        println!("new span");
-    }
-}
-
 fn main() -> Result<()> {
     let args = Args::parse();
     color_eyre::install().unwrap();
@@ -3337,58 +3311,4 @@ fn render(frame: &mut Frame, view: TorrentView) {
     render_progress_bar(frame, tl_progress, &view);
     render_peers_table(frame, top_right, &view);
     render_logs(frame, bottom);
-}
-
-fn list_tracker_peers() {
-    let content = std::fs::read("hungergames.torrent").unwrap();
-    println!("{:#?}", bencode::decode_value(&content).unwrap());
-
-    let metainfo = bencode::decode::<Metainfo>(&content).unwrap();
-    println!("{:#?}", metainfo);
-    // tracker.torrent.eu.org:451/announce
-
-    println!("{}", metainfo.announce);
-
-    let mut sock = UdpSocket::bind("0.0.0.0:0").unwrap();
-    sock.connect("tracker.torrent.eu.org:451").unwrap();
-
-    let mut buf = Vec::with_capacity(1024);
-    let req = ConnectRequest {
-        transaction_id: 0xdeadbeef,
-    };
-    req.encode(&mut buf).unwrap();
-    sock.send(&buf).unwrap();
-
-    buf.clear();
-    buf.resize(1024, 0);
-    let n = sock.recv(&mut buf).unwrap();
-    buf.resize(n, 0);
-    let res = ConnectResponse::decode(std::io::Cursor::new(&buf)).unwrap();
-    println!("response = {:#?}", res);
-
-    let peer_id = PeerId::default();
-    let req = AnnounceIpv4Request {
-        connection_id: res.connection_id,
-        transaction_id: res.transaction_id,
-        info_hash: metainfo.info_hash,
-        peer_id,
-        downloaded: 0,
-        left: metainfo.info.length,
-        uploaded: 0,
-        event: Event::None,
-        ip_address: Ipv4Addr::new(0, 0, 0, 0),
-        key: 0,
-        num_want: 50,
-        port: 61182,
-    };
-
-    buf.clear();
-    req.encode(&mut buf).unwrap();
-    sock.send(&buf).unwrap();
-
-    buf.resize(1024, 0);
-    let n = sock.recv(&mut buf).unwrap();
-    buf.resize(n, 0);
-    let res = AnnounceIpv4Response::decode(std::io::Cursor::new(&buf)).unwrap();
-    println!("{:#?}", res);
 }
