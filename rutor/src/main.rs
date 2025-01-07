@@ -2488,11 +2488,11 @@ impl TorrentState {
 
     fn process_peer_connected(&mut self, addr: SocketAddr, stream: TcpStream) {
         if self.peer_with_addr_exists(addr) {
-            // TODO: log warn
-            //println!("peer with same addr is already connected: {addr}");
+            tracing::warn!(addr = ?addr, "peer with same addr is already connected");
             return;
         }
 
+        tracing::info!(addr = ?addr, "peer connected");
         let info = self.info.clone();
         let sender = self.sender.clone();
         let peer_id = self.id;
@@ -2701,7 +2701,7 @@ impl TorrentState {
     }
 
     fn checking_try_finish(&mut self) {
-        println!(
+        tracing::info!(
             "checking: {}/{}",
             self.checking_bitfield.num_set(),
             self.checking_bitfield.len()
@@ -2709,12 +2709,12 @@ impl TorrentState {
         if !self.checking_bitfield.complete() {
             return;
         }
-        println!("done checking torrent");
+        tracing::info!("done checking torrent");
         self.mode = TorrentMode::Running;
     }
 
     fn peer_serve_pending_requests_for_piece(&mut self, piece_idx: PieceIdx, data: Bytes) {
-        //println!("serving peer requests for piece {piece_idx}");
+        tracing::trace!("serving peer requests for piece {piece_idx}");
         let mut requests = Vec::default();
         for peer in self.peers.values_mut() {
             peer.remote_requests.retain(|r| {
@@ -2924,7 +2924,7 @@ impl TorrentState {
         }
 
         let peer_addr = self.peers[peer_key].addr;
-        //println!("disconnecting peer {peer_addr}");
+        tracing::info!(addr = ?peer_addr, "peer disconnected");
 
         self.peer_cancel_all_chunks(peer_key);
         self.peers.remove(peer_key);
@@ -3146,7 +3146,7 @@ fn main() -> Result<()> {
     let filter_layer = tracing_subscriber::EnvFilter::try_from_default_env()
         .or_else(|_| tracing_subscriber::EnvFilter::try_new("info"))
         .unwrap();
-    tui_logger::init_logger(tui_logger::LevelFilter::Trace);
+    tui_logger::init_logger(tui_logger::LevelFilter::Trace).unwrap();
     tracing_subscriber::registry()
         //.with(fmt_layer)
         .with(tui_logger::tracing_subscriber_layer())
@@ -3171,15 +3171,10 @@ fn run(args: Args, mut terminal: DefaultTerminal) -> Result<()> {
         },
     );
     //torrent.connect_to_peer("127.0.0.1:51413".parse()?);
-    std::thread::sleep(Duration::from_secs(2));
-    for peer in args.peers {
-        torrent.connect_to_peer(peer);
-    }
-
-    std::thread::spawn(|| loop {
-        std::thread::sleep(Duration::from_secs(1));
-        tracing::info!("hello from thread");
-    });
+    // std::thread::sleep(Duration::from_secs(2));
+    // for peer in args.peers {
+    //     torrent.connect_to_peer(peer);
+    // }
 
     loop {
         let view = torrent.view();
@@ -3206,35 +3201,36 @@ fn render_text_box(frame: &mut Frame, rect: Rect, title: &str, content: impl std
 }
 
 fn render_peers_table(frame: &mut Frame, rect: Rect, view: &TorrentView) {
-    let rows = [Row::new(vec!["Cell1", "Cell2", "Cell3"])];
     // Columns widths are constrained in the same way as Layout...
     let widths = [
-        Constraint::Length(5),
-        Constraint::Length(5),
+        Constraint::Length(48),
+        Constraint::Length(24),
+        Constraint::Length(10),
         Constraint::Length(10),
     ];
+
+    let mut rows = Vec::with_capacity(view.peers.len());
+    for peer in view.peers.iter() {
+        rows.push(Row::new(vec![
+            format!("{:?}", peer.id),
+            peer.addr.to_string(),
+            ByteRateDisplay(0).to_string(),
+            ByteRateDisplay(0).to_string(),
+        ]));
+    }
+
     let table = Table::new(rows, widths)
         // ...and they can be separated by a fixed spacing.
         .column_spacing(1)
-        // You can set the style of the entire Table.
-        .style(Style::new().blue())
         // It has an optional header, which is simply a Row always visible at the top.
         .header(
-            Row::new(vec!["Col1", "Col2", "Col3"])
+            Row::new(vec!["ID", "Address", "Upload", "Download"])
                 .style(Style::new().bold())
                 // To add space between the header and the rest of the rows, specify the margin
                 .bottom_margin(1),
         )
-        // It has an optional footer, which is simply a Row always visible at the bottom.
-        .footer(Row::new(vec!["Updated on Dec 28"]))
         // As any other widget, a Table can be wrapped in a Block.
-        .block(Block::new().title("Table"))
-        // The selected row, column, cell and its content can also be styled.
-        .row_highlight_style(Style::new().reversed())
-        .column_highlight_style(Style::new().red())
-        .cell_highlight_style(Style::new().blue())
-        // ...and potentially show a symbol in front of the selection.
-        .highlight_symbol(">>");
+        .block(Block::new().title("Peers"));
 
     let block = Block::new().title("Peers").borders(Borders::all());
     frame.render_widget(table.block(block), rect);
