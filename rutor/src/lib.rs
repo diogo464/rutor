@@ -1,69 +1,23 @@
 use std::{
     collections::VecDeque,
-    io::{BufReader, BufWriter, Cursor, Read, Seek, Write},
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, ToSocketAddrs, UdpSocket},
+    io::{BufReader, BufWriter, Read, Seek, Write},
+    net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use bytes::{Bytes, BytesMut};
-use clap::Parser;
-use color_eyre::Result;
-use ratatui::{
-    crossterm::event,
-    layout::{Constraint, Layout, Rect},
-    style::{Color, Style, Stylize as _},
-    symbols,
-    text::Line,
-    widgets::{Block, Borders, LineGauge, Padding, Row, Table},
-    DefaultTerminal, Frame,
-};
-use serde::Serialize;
 use slotmap::{Key as _, SecondaryMap, SlotMap};
-use tracing_subscriber::{
-    layer::{Context, SubscriberExt},
-    util::SubscriberInitExt,
-};
-use tui_logger::{
-    LevelFilter, TuiLoggerLevelOutput, TuiLoggerSmartWidget, TuiLoggerWidget, TuiWidgetState,
-};
 
-#[derive(Default, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Sha1([u8; 20]);
+mod hash;
+pub use hash::Sha1;
 
-impl Sha1 {
-    pub fn hash(buf: &[u8]) -> Sha1 {
-        use sha1::Digest;
-        let mut hasher = sha1::Sha1::default();
-        hasher.update(buf);
-        Sha1(hasher.finalize().into())
-    }
+mod tracker;
+pub use tracker::{Action, Announce, AnnounceParams, Event, TrackerUdpClient};
 
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.0
-    }
-}
-
-impl std::fmt::Debug for Sha1 {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Sha1(")?;
-        for v in self.0 {
-            write!(f, "{:x}", v)?;
-        }
-        f.write_str(")")?;
-        Ok(())
-    }
-}
-
-impl std::fmt::Display for Sha1 {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for v in self.0 {
-            write!(f, "{:x}", v)?;
-        }
-        Ok(())
-    }
-}
+mod wire;
+pub use wire::Message;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PieceIdx(u32);
@@ -369,7 +323,7 @@ impl<'a> Iterator for TorrentFileRangeIterator<'a> {
 mod test_torrent_info {
     use super::*;
 
-    const BUNNY_DATA: &'static [u8] = include_bytes!("../bunny.torrent");
+    const BUNNY_DATA: &'static [u8] = include_bytes!("../../bunny.torrent");
 
     #[test]
     fn bunny_decode() {
@@ -553,544 +507,6 @@ impl bencode::FromValue for Metainfo {
             comment,
         })
     }
-}
-
-#[derive(Debug, Serialize)]
-struct TrackerRequest<'a> {
-    #[serde(skip)]
-    info_hash: &'a [u8],
-    #[serde(skip)]
-    peer_id: &'a [u8],
-    port: u16,
-    uploaded: u64,
-    downloaded: u64,
-    left: u64,
-}
-
-const PROTOCOL_ID: u64 = 0x41727101980;
-
-trait Wire: Sized {
-    fn encode<W: Write>(&self, writer: W) -> std::io::Result<()>;
-    fn decode<R: Read>(reader: R) -> std::io::Result<Self>;
-}
-
-impl Wire for u16 {
-    fn encode<W: Write>(&self, mut writer: W) -> std::io::Result<()> {
-        writer.write_all(&self.to_be_bytes())
-    }
-    fn decode<R: Read>(mut reader: R) -> std::io::Result<Self> {
-        let mut buf = [0u8; 2];
-        reader.read_exact(&mut buf)?;
-        Ok(u16::from_be_bytes(buf))
-    }
-}
-
-impl Wire for u32 {
-    fn encode<W: Write>(&self, mut writer: W) -> std::io::Result<()> {
-        writer.write_all(&self.to_be_bytes())
-    }
-    fn decode<R: Read>(mut reader: R) -> std::io::Result<Self> {
-        let mut buf = [0u8; 4];
-        reader.read_exact(&mut buf)?;
-        Ok(u32::from_be_bytes(buf))
-    }
-}
-
-impl Wire for u64 {
-    fn encode<W: Write>(&self, mut writer: W) -> std::io::Result<()> {
-        writer.write_all(&self.to_be_bytes())
-    }
-    fn decode<R: Read>(mut reader: R) -> std::io::Result<Self> {
-        let mut buf = [0u8; 8];
-        reader.read_exact(&mut buf)?;
-        Ok(u64::from_be_bytes(buf))
-    }
-}
-
-impl Wire for Ipv4Addr {
-    fn encode<W: Write>(&self, mut writer: W) -> std::io::Result<()> {
-        writer.write_all(&self.octets())
-    }
-
-    fn decode<R: Read>(mut reader: R) -> std::io::Result<Self> {
-        let mut octets = [0u8; 4];
-        reader.read_exact(&mut octets)?;
-        Ok(Ipv4Addr::from(octets))
-    }
-}
-
-impl Wire for SocketAddrV4 {
-    fn encode<W: Write>(&self, mut writer: W) -> std::io::Result<()> {
-        self.ip().encode(&mut writer)?;
-        self.port().encode(&mut writer)?;
-        Ok(())
-    }
-
-    fn decode<R: Read>(mut reader: R) -> std::io::Result<Self> {
-        let ip = Ipv4Addr::decode(&mut reader)?;
-        let port = u16::decode(&mut reader)?;
-        Ok(SocketAddrV4::new(ip, port))
-    }
-}
-
-impl Wire for Sha1 {
-    fn encode<W: Write>(&self, mut writer: W) -> std::io::Result<()> {
-        writer.write_all(self.as_bytes())
-    }
-
-    fn decode<R: Read>(mut reader: R) -> std::io::Result<Self> {
-        let mut sha1 = Sha1::default();
-        reader.read_exact(&mut sha1.0)?;
-        Ok(sha1)
-    }
-}
-
-impl Wire for PeerId {
-    fn encode<W: Write>(&self, mut writer: W) -> std::io::Result<()> {
-        writer.write_all(self.as_bytes())
-    }
-
-    fn decode<R: Read>(mut reader: R) -> std::io::Result<Self> {
-        let mut peer_id = PeerId::default();
-        reader.read_exact(&mut peer_id.0)?;
-        Ok(peer_id)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Action {
-    Connect = 0,
-    Announce = 1,
-    Scrape = 2,
-}
-
-impl Wire for Action {
-    fn encode<W: Write>(&self, writer: W) -> std::io::Result<()> {
-        (*self as u32).encode(writer)
-    }
-
-    fn decode<R: Read>(reader: R) -> std::io::Result<Self> {
-        let v = u32::decode(reader)?;
-        match v {
-            _ if v == Action::Connect as u32 => Ok(Action::Connect),
-            _ if v == Action::Announce as u32 => Ok(Action::Announce),
-            _ if v == Action::Scrape as u32 => Ok(Action::Scrape),
-            _ => Err(invalid_data("invalid action value")),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ConnectRequest {
-    pub transaction_id: u32,
-}
-
-impl Wire for ConnectRequest {
-    fn encode<W: Write>(&self, mut writer: W) -> std::io::Result<()> {
-        PROTOCOL_ID.encode(&mut writer)?;
-        Action::Connect.encode(&mut writer)?;
-        self.transaction_id.encode(&mut writer)?;
-        Ok(())
-    }
-
-    fn decode<R: Read>(mut reader: R) -> std::io::Result<Self> {
-        let protocol_id = u64::decode(&mut reader)?;
-        if protocol_id != PROTOCOL_ID {
-            return Err(invalid_data("invalid protocol magic value"));
-        }
-        let action = Action::decode(&mut reader)?;
-        if action != Action::Connect {
-            return Err(invalid_data("expected action to be 'connect'"));
-        }
-        let transaction_id = u32::decode(&mut reader)?;
-        Ok(Self { transaction_id })
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ConnectResponse {
-    pub transaction_id: u32,
-    pub connection_id: u64,
-}
-
-impl Wire for ConnectResponse {
-    fn encode<W: Write>(&self, mut writer: W) -> std::io::Result<()> {
-        Action::Connect.encode(&mut writer)?;
-        self.transaction_id.encode(&mut writer)?;
-        self.connection_id.encode(&mut writer)?;
-        Ok(())
-    }
-
-    fn decode<R: Read>(mut reader: R) -> std::io::Result<Self> {
-        let action = Action::decode(&mut reader)?;
-        if action != Action::Connect {
-            return Err(invalid_data("expected action to be 'connect'"));
-        }
-        let transaction_id = u32::decode(&mut reader)?;
-        let connection_id = u64::decode(&mut reader)?;
-        Ok(Self {
-            transaction_id,
-            connection_id,
-        })
-    }
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub enum Event {
-    #[default]
-    None = 0,
-    Completed = 1,
-    Started = 2,
-    Stopped = 3,
-}
-
-impl Wire for Event {
-    fn encode<W: Write>(&self, writer: W) -> std::io::Result<()> {
-        (*self as u32).encode(writer)
-    }
-
-    fn decode<R: Read>(reader: R) -> std::io::Result<Self> {
-        let v = u32::decode(reader)?;
-        match v {
-            _ if v == Event::None as u32 => Ok(Event::None),
-            _ if v == Event::Completed as u32 => Ok(Event::Completed),
-            _ if v == Event::Started as u32 => Ok(Event::Started),
-            _ if v == Event::Stopped as u32 => Ok(Event::Stopped),
-            _ => Err(invalid_data("invalid event value")),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct AnnounceIpv4Request {
-    pub connection_id: u64,
-    pub transaction_id: u32,
-    pub info_hash: Sha1,
-    pub peer_id: PeerId,
-    pub downloaded: u64,
-    pub left: u64,
-    pub uploaded: u64,
-    pub event: Event,
-    pub ip_address: Ipv4Addr,
-    pub key: u32,
-    pub num_want: u32,
-    pub port: u16,
-}
-
-impl Wire for AnnounceIpv4Request {
-    fn encode<W: Write>(&self, mut writer: W) -> std::io::Result<()> {
-        self.connection_id.encode(&mut writer)?;
-        Action::Announce.encode(&mut writer)?;
-        self.transaction_id.encode(&mut writer)?;
-        self.info_hash.encode(&mut writer)?;
-        self.peer_id.encode(&mut writer)?;
-        self.downloaded.encode(&mut writer)?;
-        self.left.encode(&mut writer)?;
-        self.uploaded.encode(&mut writer)?;
-        self.event.encode(&mut writer)?;
-        self.ip_address.encode(&mut writer)?;
-        self.key.encode(&mut writer)?;
-        self.num_want.encode(&mut writer)?;
-        self.port.encode(&mut writer)?;
-        Ok(())
-    }
-
-    fn decode<R: Read>(mut reader: R) -> std::io::Result<Self> {
-        let connection_id = u64::decode(&mut reader)?;
-        let action = Action::decode(&mut reader)?;
-        let transaction_id = u32::decode(&mut reader)?;
-        let info_hash = Sha1::decode(&mut reader)?;
-        let peer_id = PeerId::decode(&mut reader)?;
-        let downloaded = u64::decode(&mut reader)?;
-        let left = u64::decode(&mut reader)?;
-        let uploaded = u64::decode(&mut reader)?;
-        let event = Event::decode(&mut reader)?;
-        let ip_address = Ipv4Addr::decode(&mut reader)?;
-        let key = u32::decode(&mut reader)?;
-        let num_want = u32::decode(&mut reader)?;
-        let port = u16::decode(&mut reader)?;
-
-        if action != Action::Announce {
-            return Err(invalid_data("expected action 'announce'"));
-        }
-
-        Ok(Self {
-            connection_id,
-            transaction_id,
-            info_hash,
-            peer_id,
-            downloaded,
-            left,
-            uploaded,
-            event,
-            ip_address,
-            key,
-            num_want,
-            port,
-        })
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct AnnounceIpv4Response {
-    pub transaction_id: u32,
-    pub interval: u32,
-    pub leechers: u32,
-    pub seeders: u32,
-    pub addresses: Vec<SocketAddrV4>,
-}
-
-impl Wire for AnnounceIpv4Response {
-    fn encode<W: Write>(&self, mut writer: W) -> std::io::Result<()> {
-        Action::Announce.encode(&mut writer)?;
-        self.transaction_id.encode(&mut writer)?;
-        self.interval.encode(&mut writer)?;
-        self.leechers.encode(&mut writer)?;
-        for addr in &self.addresses {
-            addr.encode(&mut writer)?;
-        }
-        Ok(())
-    }
-
-    fn decode<R: Read>(mut reader: R) -> std::io::Result<Self> {
-        let action = Action::decode(&mut reader)?;
-        if action != Action::Announce {
-            return Err(invalid_data("expected action to be 'announce'"));
-        }
-        let transaction_id = u32::decode(&mut reader)?;
-        let interval = u32::decode(&mut reader)?;
-        let leechers = u32::decode(&mut reader)?;
-        let seeders = u32::decode(&mut reader)?;
-        let mut addresses = Vec::new();
-        loop {
-            match SocketAddrV4::decode(&mut reader) {
-                Ok(addr) => addresses.push(addr),
-                Err(e) => {
-                    if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                        break;
-                    } else {
-                        return Err(e);
-                    }
-                }
-            }
-        }
-        Ok(Self {
-            transaction_id,
-            interval,
-            leechers,
-            seeders,
-            addresses,
-        })
-    }
-}
-
-#[derive(Debug, Clone)]
-struct AnnounceParams {
-    info_hash: Sha1,
-    peer_id: PeerId,
-    downloaded: u64,
-    left: u64,
-    uploaded: u64,
-    event: Event,
-    ip_address: Option<Ipv4Addr>,
-    num_want: Option<u32>,
-    port: u16,
-}
-
-#[derive(Debug)]
-struct Announce {
-    interval: u32,
-    leechers: u32,
-    seeders: u32,
-    addresses: Vec<SocketAddrV4>,
-}
-
-struct TrackerUdpClient {
-    socket: UdpSocket,
-    connection_id: Option<u64>,
-}
-
-impl TrackerUdpClient {
-    pub fn new(addr: SocketAddr) -> std::io::Result<Self> {
-        let socket = UdpSocket::bind("0.0.0.0:0")?;
-        socket.connect(addr)?;
-        socket.set_read_timeout(Some(Duration::from_secs(5)))?;
-        Ok(Self {
-            socket,
-            connection_id: None,
-        })
-    }
-
-    pub fn announce(&mut self, params: &AnnounceParams) -> std::io::Result<Announce> {
-        let connection_id = self.connect()?;
-        //println!("connection id = {connection_id}");
-        let request = AnnounceIpv4Request {
-            connection_id,
-            transaction_id: random_transaction_id(),
-            info_hash: params.info_hash,
-            peer_id: params.peer_id,
-            downloaded: params.downloaded,
-            left: params.left,
-            uploaded: params.uploaded,
-            event: params.event,
-            ip_address: params.ip_address.unwrap_or(Ipv4Addr::new(0, 0, 0, 0)),
-            key: 0,
-            num_want: params.num_want.unwrap_or(u32::MAX),
-            port: params.port,
-        };
-
-        let mut buffer = [0u8; 1500];
-        request.encode(Cursor::new(&mut buffer[..]))?;
-        self.socket.send(&buffer[..])?;
-
-        let n = self.socket.recv(&mut buffer)?;
-        let buffer = &buffer[..n];
-        let response = AnnounceIpv4Response::decode(Cursor::new(buffer))?;
-        Ok(Announce {
-            interval: response.interval,
-            leechers: response.leechers,
-            seeders: response.seeders,
-            addresses: response.addresses,
-        })
-    }
-
-    fn connect(&mut self) -> std::io::Result<u64> {
-        if let Some(connection_id) = self.connection_id {
-            Ok(connection_id)
-        } else {
-            let mut buffer = Vec::default();
-            let request = ConnectRequest {
-                transaction_id: random_transaction_id(),
-            };
-            request.encode(&mut buffer)?;
-            self.socket.send(&buffer)?;
-
-            buffer.resize(1500, 0);
-            let n = self.socket.recv(&mut buffer)?;
-            buffer.truncate(n);
-            let response = ConnectResponse::decode(Cursor::new(&buffer))?;
-            Ok(response.connection_id)
-        }
-    }
-}
-
-fn random_transaction_id() -> u32 {
-    rand::random()
-}
-
-fn invalid_data(msg: &'static str) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::InvalidData, msg)
-}
-
-const HANDSHAKE_PREFIX_IDX: usize = 0;
-const HANDSHAKE_PREFIX_LENGTH: usize = 20;
-const HANDSHAKE_PREFIX: &[u8; HANDSHAKE_PREFIX_LENGTH] = b"\x13BitTorrent protocol";
-
-const HANDSHAKE_RESERVED_IDX: usize = HANDSHAKE_PREFIX_LENGTH;
-const HANDSHAKE_RESERVED_LENGTH: usize = 8;
-
-const HANDSHAKE_INFOHASH_IDX: usize = HANDSHAKE_RESERVED_IDX + HANDSHAKE_RESERVED_LENGTH;
-const HANDSHAKE_PEERID_IDX: usize = HANDSHAKE_INFOHASH_IDX + 20;
-
-const HANDSHAKE_LENGTH: usize = HANDSHAKE_PREFIX_LENGTH
-    + HANDSHAKE_RESERVED_LENGTH // 8 reserved bytes, currently all zero
-    + 20 // 20 byte sha1 info_hash
-    + 20; // 20 byte peer id
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum MessageKind {
-    Choke = 0,
-    Unchoke = 1,
-    Interested = 2,
-    NotInterested = 3,
-    Have = 4,
-    Bitfield = 5,
-    Request = 6,
-    Piece = 7,
-    Cancel = 8,
-}
-
-impl MessageKind {
-    fn from_u8(kind: u8) -> Option<MessageKind> {
-        match kind {
-            _ if kind == MessageKind::Choke as u8 => Some(MessageKind::Choke),
-            _ if kind == MessageKind::Unchoke as u8 => Some(MessageKind::Unchoke),
-            _ if kind == MessageKind::Interested as u8 => Some(MessageKind::Interested),
-            _ if kind == MessageKind::NotInterested as u8 => Some(MessageKind::NotInterested),
-            _ if kind == MessageKind::Have as u8 => Some(MessageKind::Have),
-            _ if kind == MessageKind::Bitfield as u8 => Some(MessageKind::Bitfield),
-            _ if kind == MessageKind::Request as u8 => Some(MessageKind::Request),
-            _ if kind == MessageKind::Piece as u8 => Some(MessageKind::Piece),
-            _ if kind == MessageKind::Cancel as u8 => Some(MessageKind::Cancel),
-            _ => None,
-        }
-    }
-
-    fn to_u8(&self) -> u8 {
-        *self as u8
-    }
-}
-
-fn error(msg: &str) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::Other, msg)
-}
-
-#[derive(Debug)]
-struct Handshake {
-    info_hash: Sha1,
-    peer_id: PeerId,
-}
-
-struct HandshakeSplit<'a> {
-    prefix: &'a [u8; HANDSHAKE_PREFIX_LENGTH],
-    reserved: &'a [u8; HANDSHAKE_RESERVED_LENGTH],
-    info_hash: &'a [u8; 20],
-    peer_id: &'a [u8; 20],
-}
-
-impl<'a> HandshakeSplit<'a> {
-    fn new(buf: &'a [u8; HANDSHAKE_LENGTH]) -> HandshakeSplit {
-        let (prefix, buf) = buf.split_at(HANDSHAKE_PREFIX_LENGTH);
-        let (reserved, buf) = buf.split_at(HANDSHAKE_RESERVED_LENGTH);
-        let (info_hash, buf) = buf.split_at(20);
-        let peer_id = buf;
-
-        HandshakeSplit {
-            prefix: prefix.try_into().unwrap(),
-            reserved: reserved.try_into().unwrap(),
-            info_hash: info_hash.try_into().unwrap(),
-            peer_id: peer_id.try_into().unwrap(),
-        }
-    }
-}
-
-fn serialize_handshake(handshake: &Handshake) -> [u8; HANDSHAKE_LENGTH] {
-    let mut buf = [0u8; HANDSHAKE_LENGTH];
-    buf[0..HANDSHAKE_PREFIX_LENGTH].copy_from_slice(HANDSHAKE_PREFIX);
-    buf[HANDSHAKE_INFOHASH_IDX..HANDSHAKE_INFOHASH_IDX + 20]
-        .copy_from_slice(handshake.info_hash.as_bytes());
-    buf[HANDSHAKE_PEERID_IDX..HANDSHAKE_PEERID_IDX + 20]
-        .copy_from_slice(handshake.info_hash.as_bytes());
-    buf
-}
-
-fn write_handshake<W: Write>(mut writer: W, handshake: &Handshake) -> std::io::Result<()> {
-    let buf = serialize_handshake(handshake);
-    writer.write_all(&buf)?;
-    Ok(())
-}
-
-fn read_handshake<R: Read>(mut reader: R) -> std::io::Result<Handshake> {
-    let mut buf = [0u8; HANDSHAKE_LENGTH];
-    reader.read_exact(&mut buf)?;
-
-    let split = HandshakeSplit::new(&buf);
-    assert_eq!(split.prefix, HANDSHAKE_PREFIX);
-
-    Ok(Handshake {
-        info_hash: Sha1(*split.info_hash),
-        peer_id: PeerId(*split.peer_id),
-    })
 }
 
 #[derive(Default, Clone)]
@@ -1304,192 +720,6 @@ mod test {
     }
 }
 
-#[derive(Debug)]
-enum Message {
-    Choke,
-    Unchoke,
-    Interested,
-    NotInterested,
-    Have {
-        index: PieceIdx,
-    },
-    Bitfield {
-        bitfield: Vec<u8>,
-    },
-    Request {
-        index: PieceIdx,
-        begin: u32,
-        length: u32,
-    },
-    Piece {
-        index: PieceIdx,
-        begin: u32,
-        data: Bytes,
-    },
-    Cancel {
-        index: PieceIdx,
-        begin: u32,
-        length: u32,
-    },
-}
-
-fn decode_message(buf: &[u8]) -> std::io::Result<Message> {
-    if buf.len() < 1 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            "read empty buffer",
-        ));
-    }
-    let message_kind = match MessageKind::from_u8(buf[0]) {
-        Some(kind) => kind,
-        None => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("unknown message kind: {}", buf[0]),
-            ));
-        }
-    };
-    let message = match message_kind {
-        MessageKind::Choke => {
-            // TODO: check len == 1
-            Message::Choke
-        }
-        MessageKind::Unchoke => {
-            // TODO: check len == 1
-            Message::Unchoke
-        }
-        MessageKind::Interested => {
-            // TODO: check len == 1
-            Message::Interested
-        }
-        MessageKind::NotInterested => {
-            // TODO: check len == 1
-            Message::NotInterested
-        }
-        MessageKind::Have => {
-            // TODO: check len == 5
-            let index = PieceIdx::from(u32::from_be_bytes(buf[1..5].try_into().unwrap()));
-            Message::Have { index }
-        }
-        MessageKind::Bitfield => Message::Bitfield {
-            bitfield: buf[1..].to_owned(),
-        },
-        MessageKind::Request => {
-            // TODO: check len == 13
-            let index = PieceIdx::from(u32::from_be_bytes(buf[1..5].try_into().unwrap()));
-            let begin = u32::from_be_bytes(buf[5..9].try_into().unwrap());
-            let length = u32::from_be_bytes(buf[9..13].try_into().unwrap());
-            Message::Request {
-                index,
-                begin,
-                length,
-            }
-        }
-        MessageKind::Piece => {
-            // TODO: check len >= 9
-            let index = PieceIdx::from(u32::from_be_bytes(buf[1..5].try_into().unwrap()));
-            let begin = u32::from_be_bytes(buf[5..9].try_into().unwrap());
-            let data = Bytes::copy_from_slice(&buf[9..]);
-            Message::Piece { index, begin, data }
-        }
-        MessageKind::Cancel => {
-            // TODO: check len == 13
-            let index = PieceIdx::from(u32::from_be_bytes(buf[1..5].try_into().unwrap()));
-            let begin = u32::from_be_bytes(buf[5..9].try_into().unwrap());
-            let length = u32::from_be_bytes(buf[9..13].try_into().unwrap());
-            Message::Request {
-                index,
-                begin,
-                length,
-            }
-        }
-    };
-    Ok(message)
-}
-
-fn read_message<R: Read>(mut reader: R) -> std::io::Result<Message> {
-    let mut buf = Vec::new();
-    let mut len = [0u8; 4];
-    reader.read_exact(&mut len)?;
-    let len = u32::from_be_bytes(len);
-    buf.resize(len as usize, 0);
-    reader.read_exact(&mut buf)?;
-    Ok(decode_message(&buf)?)
-}
-
-fn write_u32<W: Write>(mut writer: W, value: u32) -> std::io::Result<()> {
-    writer.write_all(&value.to_be_bytes())
-}
-
-fn write_message_kind<W: Write>(mut writer: W, kind: MessageKind) -> std::io::Result<()> {
-    writer.write_all(&[kind.to_u8()])
-}
-
-fn write_message<W: Write>(mut writer: W, message: &Message) -> std::io::Result<()> {
-    match message {
-        Message::Choke => {
-            write_u32(&mut writer, 1)?;
-            write_message_kind(&mut writer, MessageKind::Choke)
-        }
-        Message::Unchoke => {
-            write_u32(&mut writer, 1)?;
-            write_message_kind(&mut writer, MessageKind::Unchoke)
-        }
-        Message::Interested => {
-            write_u32(&mut writer, 1)?;
-            write_message_kind(&mut writer, MessageKind::Interested)
-        }
-        Message::NotInterested => {
-            write_u32(&mut writer, 1)?;
-            write_message_kind(&mut writer, MessageKind::NotInterested)
-        }
-        Message::Have { index } => {
-            write_u32(&mut writer, 5)?;
-            write_message_kind(&mut writer, MessageKind::Have)?;
-            write_u32(&mut writer, u32::from(*index))?;
-            Ok(())
-        }
-        Message::Bitfield { bitfield } => {
-            write_u32(&mut writer, (bitfield.len() + 1) as u32)?;
-            write_message_kind(&mut writer, MessageKind::Bitfield)?;
-            writer.write_all(&bitfield)?;
-            Ok(())
-        }
-        Message::Request {
-            index,
-            begin,
-            length,
-        } => {
-            write_u32(&mut writer, 13)?;
-            write_message_kind(&mut writer, MessageKind::Request)?;
-            write_u32(&mut writer, u32::from(*index))?;
-            write_u32(&mut writer, *begin)?;
-            write_u32(&mut writer, *length)?;
-            Ok(())
-        }
-        Message::Piece { index, begin, data } => {
-            let len = 9 + data.len() as u32;
-            write_u32(&mut writer, len)?;
-            write_message_kind(&mut writer, MessageKind::Piece)?;
-            write_u32(&mut writer, u32::from(*index))?;
-            write_u32(&mut writer, *begin)?;
-            writer.write_all(&data)?;
-            Ok(())
-        }
-        Message::Cancel {
-            index,
-            begin,
-            length,
-        } => {
-            write_u32(&mut writer, 12)?;
-            write_u32(&mut writer, u32::from(*index))?;
-            write_u32(&mut writer, *begin)?;
-            write_u32(&mut writer, *length)?;
-            Ok(())
-        }
-    }
-}
-
 slotmap::new_key_type! {
     pub struct PieceKey;
     pub struct FileKey;
@@ -1509,7 +739,7 @@ impl PieceKey {
 }
 
 const CHUNK_LENGTH: u32 = 16 * 1024;
-const MAX_PEER_PENDING_CHUNKS: usize = 256;
+const MAX_PEER_PENDING_CHUNKS: usize = 32;
 const PEER_COUNT_LIMIT: usize = 50;
 
 type Sender<T> = std::sync::mpsc::Sender<T>;
@@ -1583,8 +813,8 @@ fn peer_io_connect(
     ) -> std::io::Result<(TcpStream, PeerId)> {
         let mut stream = TcpStream::connect(addr)?;
         stream.set_write_timeout(Some(Duration::from_secs(8)))?;
-        write_handshake(&mut stream, &Handshake { info_hash, peer_id })?;
-        let handshake = read_handshake(&mut stream)?;
+        wire::write_handshake(&mut stream, &wire::Handshake { info_hash, peer_id })?;
+        let handshake = wire::read_handshake(&mut stream)?;
         if handshake.info_hash != info_hash {
             return Err(std::io::Error::other("handshake info hash missmatch"));
         }
@@ -1630,11 +860,11 @@ fn peer_io_accept(
         info_hash: Sha1,
     ) -> std::io::Result<(TcpStream, PeerId)> {
         stream.set_write_timeout(Some(Duration::from_secs(8)))?;
-        let handshake = read_handshake(&mut stream)?;
+        let handshake = wire::read_handshake(&mut stream)?;
         if handshake.info_hash != info_hash {
             return Err(std::io::Error::other("handshake info hash missmatch"));
         }
-        write_handshake(&mut stream, &Handshake { info_hash, peer_id })?;
+        wire::write_handshake(&mut stream, &wire::Handshake { info_hash, peer_id })?;
         Ok((stream, handshake.peer_id))
     }
 
@@ -1666,7 +896,7 @@ fn peer_io_accept(
 fn peer_io_reader(key: PeerKey, sender: TorrentSender, tcp_stream: Arc<TcpStream>) {
     let mut stream = BufReader::new(&*tcp_stream);
     loop {
-        match read_message(&mut stream) {
+        match wire::read_message(&mut stream) {
             Ok(message) => {
                 if sender
                     .send(TorrentMsg::PeerMessage { key, message })
@@ -1693,7 +923,7 @@ fn peer_io_writer(
 ) {
     let mut stream = BufWriter::new(&*tcp_stream);
     while let Ok(message) = receiver.recv() {
-        let result = write_message(&mut stream, &message).and_then(|_| stream.flush());
+        let result = wire::write_message(&mut stream, &message).and_then(|_| stream.flush());
         if let Err(error) = result {
             let _ = sender.send(TorrentMsg::PeerError { key, error });
             break;
@@ -2112,6 +1342,8 @@ struct PeerState {
     id: PeerId,
     io: PeerIO,
     addr: SocketAddr,
+    network_stats: NetworkStatsAccum,
+    // TODO: have a timeout to disconnect peers that don't send a handshake in a couple of seconds
     handshake_received: bool,
     /// have we received the bitfield from the remote peer?
     /// if the first message is not the bitfield, then it is implied that it is empty
@@ -2135,6 +1367,7 @@ impl PeerState {
             id: Default::default(),
             io,
             addr,
+            network_stats: Default::default(),
             handshake_received: false,
             bitfield_received: false,
             bitfield: Default::default(),
@@ -2351,6 +1584,8 @@ impl TorrentState {
             peers.push(TorrentViewPeer {
                 id: peer.id,
                 addr: peer.addr,
+                upload_rate: peer.network_stats.upload_rate(),
+                download_rate: peer.network_stats.download_rate(),
             });
         }
 
@@ -2379,7 +1614,7 @@ impl TorrentState {
             return;
         }
 
-        //println!("received handshake");
+        tracing::info!("received handshake for peer id {id:?}");
         peer.handshake_received = true;
         peer.id = id;
     }
@@ -2649,6 +1884,7 @@ impl TorrentState {
         peer.pending_chunks.swap_remove(pending_chunk_idx);
         chunk.data = Some(data);
 
+        peer.network_stats.add_download(data_len);
         self.network_stats.add_download(data_len);
         self.attempt_finalize_piece(piece_key);
         self.request_chunks_from(peer_key);
@@ -2944,10 +2180,10 @@ fn request_message_from_chunk(chunk: &ChunkState) -> Message {
 }
 
 #[derive(Debug)]
-struct TorrentConfig {
-    use_trackers: bool,
-    listen: Option<SocketAddr>,
-    assume_complete: bool,
+pub struct TorrentConfig {
+    pub use_trackers: bool,
+    pub listen: Option<SocketAddr>,
+    pub assume_complete: bool,
 }
 
 impl Default for TorrentConfig {
@@ -2961,7 +2197,7 @@ impl Default for TorrentConfig {
 }
 
 #[derive(Clone)]
-struct Torrent {
+pub struct Torrent {
     sender: TorrentSender,
 }
 
@@ -3042,6 +2278,8 @@ pub enum TorrentViewState {
 pub struct TorrentViewPeer {
     pub id: PeerId,
     pub addr: SocketAddr,
+    pub upload_rate: u32,
+    pub download_rate: u32,
 }
 
 pub struct TorrentView {
@@ -3049,40 +2287,6 @@ pub struct TorrentView {
     pub peers: Vec<TorrentViewPeer>,
     pub progress: f64,
     pub state: TorrentViewState,
-}
-
-pub struct ByteDisplay(u64);
-
-impl std::fmt::Display for ByteDisplay {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let (n, suffix) = if self.0 > 1024 * 1024 * 1024 {
-            (self.0 as f64 / (1024.0 * 1024.0 * 1024.0), "GiB")
-        } else if self.0 > 1024 * 1024 {
-            (self.0 as f64 / (1024.0 * 1024.0), "MiB")
-        } else if self.0 > 1024 {
-            (self.0 as f64 / 1024.0, "KiB")
-        } else {
-            (self.0 as f64, "B")
-        };
-        write!(f, "{n} {suffix}")
-    }
-}
-
-pub struct ByteRateDisplay(u64);
-
-impl std::fmt::Display for ByteRateDisplay {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let (n, suffix) = if self.0 > 1024 * 1024 * 1024 {
-            (self.0 as f64 / (1024.0 * 1024.0 * 1024.0), "GiB/s")
-        } else if self.0 > 1024 * 1024 {
-            (self.0 as f64 / (1024.0 * 1024.0), "MiB/s")
-        } else if self.0 > 1024 {
-            (self.0 as f64 / 1024.0, "KiB/s")
-        } else {
-            (self.0 as f64, "B/s")
-        };
-        write!(f, "{n} {suffix}")
-    }
 }
 
 fn extract_tracker_urls(info: &TorrentInfo) -> Vec<String> {
@@ -3115,196 +2319,4 @@ fn extract_udp_tracker_addresses(info: &Metainfo) -> Vec<SocketAddr> {
         }
     }
     addrs
-}
-
-#[derive(Debug, Parser)]
-struct Args {
-    #[clap(default_value = "bunny.torrent")]
-    torrent: String,
-
-    #[clap(long)]
-    peers: Vec<SocketAddr>,
-
-    #[clap(long)]
-    listen: Option<SocketAddr>,
-
-    #[clap(long)]
-    no_trackers: bool,
-
-    #[clap(long)]
-    seed: bool,
-
-    #[clap(long)]
-    assume_complete: bool,
-}
-
-fn main() -> Result<()> {
-    let args = Args::parse();
-    color_eyre::install().unwrap();
-    let terminal = ratatui::init();
-    //let fmt_layer = tracing_subscriber::fmt::layer().with_target(false);
-    let filter_layer = tracing_subscriber::EnvFilter::try_from_default_env()
-        .or_else(|_| tracing_subscriber::EnvFilter::try_new("info"))
-        .unwrap();
-    tui_logger::init_logger(tui_logger::LevelFilter::Trace).unwrap();
-    tracing_subscriber::registry()
-        //.with(fmt_layer)
-        .with(tui_logger::tracing_subscriber_layer())
-        .with(filter_layer)
-        .init();
-    let result = run(args, terminal);
-    ratatui::restore();
-    result
-}
-
-fn run(args: Args, mut terminal: DefaultTerminal) -> Result<()> {
-    let content = std::fs::read(&args.torrent).unwrap();
-    let torrent_info = TorrentInfo::decode(&content)?;
-    //println!("{torrent_info:#?}");
-    let torrent = Torrent::new_with(
-        torrent_info,
-        TorrentConfig {
-            use_trackers: !args.no_trackers,
-            listen: args.listen,
-            assume_complete: args.assume_complete,
-            ..Default::default()
-        },
-    );
-    //torrent.connect_to_peer("127.0.0.1:51413".parse()?);
-    // std::thread::sleep(Duration::from_secs(2));
-    // for peer in args.peers {
-    //     torrent.connect_to_peer(peer);
-    // }
-
-    loop {
-        let view = torrent.view();
-        terminal.draw(move |frame| render(frame, view))?;
-        if event::poll(Duration::from_millis(500))? {
-            if matches!(event::read()?, event::Event::Key(_)) {
-                break;
-            }
-        }
-
-        if torrent.completed() && !args.seed {
-            break;
-        }
-    }
-    Ok(())
-}
-
-fn render_text_box(frame: &mut Frame, rect: Rect, title: &str, content: impl std::fmt::Display) {
-    let block = Block::new().title(title).borders(Borders::all());
-    let area = block.inner(rect);
-    let text = Line::from(content.to_string());
-    frame.render_widget(block, rect);
-    frame.render_widget(text, area);
-}
-
-fn render_peers_table(frame: &mut Frame, rect: Rect, view: &TorrentView) {
-    // Columns widths are constrained in the same way as Layout...
-    let widths = [
-        Constraint::Length(48),
-        Constraint::Length(24),
-        Constraint::Length(10),
-        Constraint::Length(10),
-    ];
-
-    let mut rows = Vec::with_capacity(view.peers.len());
-    for peer in view.peers.iter() {
-        rows.push(Row::new(vec![
-            format!("{:?}", peer.id),
-            peer.addr.to_string(),
-            ByteRateDisplay(0).to_string(),
-            ByteRateDisplay(0).to_string(),
-        ]));
-    }
-
-    let table = Table::new(rows, widths)
-        // ...and they can be separated by a fixed spacing.
-        .column_spacing(1)
-        // It has an optional header, which is simply a Row always visible at the top.
-        .header(
-            Row::new(vec!["ID", "Address", "Upload", "Download"])
-                .style(Style::new().bold())
-                // To add space between the header and the rest of the rows, specify the margin
-                .bottom_margin(1),
-        )
-        // As any other widget, a Table can be wrapped in a Block.
-        .block(Block::new().title("Peers"));
-
-    let block = Block::new().title("Peers").borders(Borders::all());
-    frame.render_widget(table.block(block), rect);
-}
-
-fn render_progress_bar(frame: &mut Frame, rect: Rect, view: &TorrentView) {
-    let gauge = LineGauge::default()
-        .block(Block::bordered().title("Progress"))
-        .filled_style(Style::new().white().on_black().bold())
-        .line_set(symbols::line::THICK)
-        .ratio(view.progress);
-    frame.render_widget(gauge, rect);
-}
-
-fn render_logs(frame: &mut Frame, rect: Rect) {
-    let logger = TuiLoggerWidget::default()
-        .block(Block::bordered().title("Logs"))
-        .style_error(Style::default().fg(Color::Red))
-        .style_debug(Style::default().fg(Color::Green))
-        .style_warn(Style::default().fg(Color::Yellow))
-        .style_trace(Style::default().fg(Color::Magenta))
-        .style_info(Style::default().fg(Color::Cyan))
-        .output_separator(':')
-        .output_timestamp(Some("%H:%M:%S".to_string()))
-        .output_level(Some(TuiLoggerLevelOutput::Abbreviated))
-        .output_target(true)
-        .output_file(true)
-        .output_line(true)
-        .style(Style::default().fg(Color::White));
-    frame.render_widget(logger, rect);
-}
-
-fn render(frame: &mut Frame, view: TorrentView) {
-    let block = Block::new()
-        .borders(Borders::all())
-        .title("rutor")
-        .padding(Padding::uniform(1));
-    let area = block.inner(frame.area());
-
-    let [top, bottom] =
-        Layout::vertical([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)]).areas(area);
-    let [top_left, top_right] =
-        Layout::horizontal([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)]).areas(top);
-
-    let [tl_name, tl_size, tl_num_files, _, tl_status, tl_progress] = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Length(3),
-        Constraint::Length(3),
-        Constraint::Fill(1),
-        Constraint::Length(3),
-        Constraint::Length(3),
-    ])
-    .areas(top_left);
-
-    frame.render_widget(&block, frame.area());
-    render_text_box(frame, tl_name, "Name", view.info.name());
-    render_text_box(frame, tl_size, "Size", view.info.total_size());
-    render_text_box(
-        frame,
-        tl_num_files,
-        "Number of Files",
-        view.info.files().len(),
-    );
-    render_text_box(
-        frame,
-        tl_status,
-        "Status",
-        match view.state {
-            TorrentViewState::Paused => "paused",
-            TorrentViewState::Running => "running",
-            TorrentViewState::Checking => "checking",
-        },
-    );
-    render_progress_bar(frame, tl_progress, &view);
-    render_peers_table(frame, top_right, &view);
-    render_logs(frame, bottom);
 }

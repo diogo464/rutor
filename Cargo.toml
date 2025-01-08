@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["bencode", "rutor"]
+members = ["bencode", "rutor", "rutor-cli"]
 
 [profile.release]
 debug = true

@@ -1407,15 +1407,23 @@ version = "0.1.0"
 dependencies = [
  "bencode",
  "bytes",
- "clap",
- "color-eyre",
  "insta",
  "rand",
- "ratatui",
  "reqwest",
  "serde",
  "sha1",
  "slotmap",
+ "tracing",
+]
+
+[[package]]
+name = "rutor-cli"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "color-eyre",
+ "ratatui",
+ "rutor",
  "tracing",
  "tracing-subscriber",
  "tui-logger",

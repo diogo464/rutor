@@ -1,0 +1,14 @@
+[package]
+name = "rutor-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rutor = { path = "../rutor" }
+
+clap = { version = "4.5.23", features = ["derive"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+color-eyre = "0.6.3"
+tui-logger = { version = "0.14.1", features = ["tracing-support"] }
+ratatui = { version = "0.29.0", features = ["all-widgets", "crossterm"] }

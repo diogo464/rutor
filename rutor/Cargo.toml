@@ -6,17 +6,12 @@ edition = "2021"
 [dependencies]
 bencode = { path = "../bencode" }
 bytes = "1.9.0"
-clap = { version = "4.5.23", features = ["derive"] }
-color-eyre = "0.6.3"
 rand = "0.8.5"
-ratatui = { version = "0.29.0", features = ["all-widgets", "crossterm"] }
 reqwest = { version = "0.12.8", features = ["blocking"] }
 serde = { version = "1.0.210", features = ["derive"] }
 sha1 = "0.10.6"
 slotmap = "1.0.7"
 tracing = "0.1.41"
-tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
-tui-logger = { version = "0.14.1", features = ["tracing-support"] }
 
 [profile.release]
 debug = true
