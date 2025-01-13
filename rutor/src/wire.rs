@@ -1,6 +1,7 @@
 use std::io::{Read, Write};
 
 use bytes::Bytes;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{PeerId, PieceIdx, Sha1};
 
@@ -8,7 +9,7 @@ const HANDSHAKE_PREFIX_IDX: usize = 0;
 const HANDSHAKE_PREFIX_LENGTH: usize = 20;
 const HANDSHAKE_PREFIX: &[u8; HANDSHAKE_PREFIX_LENGTH] = b"\x13BitTorrent protocol";
 
-const HANDSHAKE_RESERVED_IDX: usize = HANDSHAKE_PREFIX_LENGTH;
+const HANDSHAKE_RESERVED_IDX: usize = HANDSHAKE_PREFIX_IDX + HANDSHAKE_PREFIX_LENGTH;
 const HANDSHAKE_RESERVED_LENGTH: usize = 8;
 
 const HANDSHAKE_INFOHASH_IDX: usize = HANDSHAKE_RESERVED_IDX + HANDSHAKE_RESERVED_LENGTH;
@@ -19,7 +20,7 @@ const HANDSHAKE_LENGTH: usize = HANDSHAKE_PREFIX_LENGTH
     + 20 // 20 byte sha1 info_hash
     + 20; // 20 byte peer id
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Message {
     Choke,
     Unchoke,
@@ -131,9 +132,33 @@ pub fn write_handshake<W: Write>(mut writer: W, handshake: &Handshake) -> std::i
     Ok(())
 }
 
+pub async fn write_handshake_async<W: AsyncWrite + Unpin>(
+    mut writer: W,
+    handshake: &Handshake,
+) -> std::io::Result<()> {
+    let buf = serialize_handshake(handshake);
+    writer.write_all(&buf).await?;
+    Ok(())
+}
+
 pub fn read_handshake<R: Read>(mut reader: R) -> std::io::Result<Handshake> {
     let mut buf = [0u8; HANDSHAKE_LENGTH];
     reader.read_exact(&mut buf)?;
+
+    let split = HandshakeSplit::new(&buf);
+    assert_eq!(split.prefix, HANDSHAKE_PREFIX);
+
+    Ok(Handshake {
+        info_hash: Sha1(*split.info_hash),
+        peer_id: PeerId(*split.peer_id),
+    })
+}
+
+pub async fn read_handshake_async<R: AsyncRead + Unpin>(
+    mut reader: R,
+) -> std::io::Result<Handshake> {
+    let mut buf = [0u8; HANDSHAKE_LENGTH];
+    reader.read_exact(&mut buf).await?;
 
     let split = HandshakeSplit::new(&buf);
     assert_eq!(split.prefix, HANDSHAKE_PREFIX);
@@ -228,6 +253,16 @@ pub fn read_message<R: Read>(mut reader: R) -> std::io::Result<Message> {
     Ok(decode_message(&buf)?)
 }
 
+pub async fn read_message_async<R: AsyncRead + Unpin>(mut reader: R) -> std::io::Result<Message> {
+    let mut buf = Vec::new();
+    let mut len = [0u8; 4];
+    reader.read_exact(&mut len).await?;
+    let len = u32::from_be_bytes(len);
+    buf.resize(len as usize, 0);
+    reader.read_exact(&mut buf).await?;
+    Ok(decode_message(&buf)?)
+}
+
 fn write_u32<W: Write>(mut writer: W, value: u32) -> std::io::Result<()> {
     writer.write_all(&value.to_be_bytes())
 }
@@ -299,4 +334,14 @@ pub fn write_message<W: Write>(mut writer: W, message: &Message) -> std::io::Res
             Ok(())
         }
     }
+}
+
+pub async fn write_message_async<W: AsyncWrite + Unpin>(
+    mut writer: W,
+    message: &Message,
+) -> std::io::Result<()> {
+    let mut buffer = Vec::default();
+    write_message(&mut buffer, message)?;
+    writer.write_all(&buffer).await?;
+    Ok(())
 }

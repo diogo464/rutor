@@ -1,4 +1,8 @@
-use std::{net::SocketAddr, time::Duration};
+use std::{
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use clap::Parser;
 use color_eyre::Result;
@@ -70,7 +74,13 @@ struct Args {
     assume_complete: bool,
 }
 
-fn main() -> Result<()> {
+struct RenderSharedState {
+    view: TorrentView,
+    exit: bool,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
     let args = Args::parse();
     color_eyre::install().unwrap();
     let terminal = ratatui::init();
@@ -84,41 +94,56 @@ fn main() -> Result<()> {
         .with(tui_logger::tracing_subscriber_layer())
         .with(filter_layer)
         .init();
-    let result = run(args, terminal);
+    let result = run(args, terminal).await;
     ratatui::restore();
     result
 }
 
-fn run(args: Args, mut terminal: DefaultTerminal) -> Result<()> {
+async fn run(args: Args, terminal: DefaultTerminal) -> Result<()> {
     let content = std::fs::read(&args.torrent).unwrap();
     let torrent_info = TorrentInfo::decode(&content)?;
-    //println!("{torrent_info:#?}");
-    let torrent = Torrent::new_with(
-        torrent_info,
-        TorrentConfig {
-            use_trackers: !args.no_trackers,
-            listen: args.listen,
-            assume_complete: args.assume_complete,
-            ..Default::default()
-        },
-    );
-    //torrent.connect_to_peer("127.0.0.1:51413".parse()?);
-    // std::thread::sleep(Duration::from_secs(2));
-    // for peer in args.peers {
-    //     torrent.connect_to_peer(peer);
-    // }
+    let session = rutor::Session::new();
+    let torrent_config = rutor::TorrentConfig {
+        use_trackers: !args.no_trackers,
+        listen: args.listen,
+        assume_complete: args.assume_complete,
+        ..Default::default()
+    };
+    let torrent = session.torrent_add_with(torrent_info, torrent_config).await;
+    let render_state = Arc::new(Mutex::new(RenderSharedState {
+        view: torrent.view().await,
+        exit: false,
+    }));
+    let render_handle = tokio::task::spawn_blocking({
+        let state = render_state.clone();
+        move || render_loop(terminal, state)
+    });
 
     loop {
-        let view = torrent.view();
-        terminal.draw(move |frame| render(frame, view))?;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let view = torrent.view().await;
+        render_state.lock().unwrap().view = view;
+        if torrent.completed().await && !args.seed || render_handle.is_finished() {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn render_loop(mut terminal: DefaultTerminal, state: Arc<Mutex<RenderSharedState>>) -> Result<()> {
+    loop {
+        let view = {
+            let state = state.lock().unwrap();
+            if state.exit {
+                break;
+            }
+            state.view.clone()
+        };
+        terminal.draw(move |frame| render(frame, &view))?;
         if event::poll(Duration::from_millis(500))? {
             if matches!(event::read()?, event::Event::Key(_)) {
                 break;
             }
-        }
-
-        if torrent.completed() && !args.seed {
-            break;
         }
     }
     Ok(())
@@ -198,7 +223,7 @@ fn render_logs(frame: &mut Frame, rect: Rect) {
     frame.render_widget(logger, rect);
 }
 
-fn render(frame: &mut Frame, view: TorrentView) {
+fn render(frame: &mut Frame, view: &TorrentView) {
     let block = Block::new()
         .borders(Borders::all())
         .title("rutor")

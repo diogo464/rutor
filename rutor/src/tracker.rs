@@ -358,6 +358,7 @@ pub struct Announce {
     pub addresses: Vec<SocketAddrV4>,
 }
 
+#[derive(Debug)]
 pub struct TrackerUdpClient {
     socket: UdpSocket,
     connection_id: Option<u64>,

@@ -11,6 +11,7 @@ reqwest = { version = "0.12.8", features = ["blocking"] }
 serde = { version = "1.0.210", features = ["derive"] }
 sha1 = "0.10.6"
 slotmap = "1.0.7"
+tokio = { version = "1.43.0", features = ["full"] }
 tracing = "0.1.41"
 
 [profile.release]
