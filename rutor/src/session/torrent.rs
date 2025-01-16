@@ -355,7 +355,14 @@ impl TorrentState {
     }
 
     pub fn tick(&mut self) {
-        torrent_process_tick(self);
+        if self.mode == TorrentMode::Running {
+            self.check_peer_interests();
+            self.request_chunks();
+
+            if self.config.use_trackers {
+                self.trackers_announce();
+            }
+        }
     }
 
     pub fn check(&mut self) {
@@ -376,6 +383,31 @@ impl TorrentState {
 
     pub fn connect(&mut self, address: SocketAddr) {
         self.process_connect_to_peer(address);
+    }
+
+    pub fn view(&self) -> TorrentView {
+        let mut peers = Vec::with_capacity(self.peers.len());
+        for peer in self.peers.values() {
+            peers.push(TorrentViewPeer {
+                id: peer.id,
+                addr: peer.addr,
+                upload_rate: peer.network_stats.upload_rate(),
+                download_rate: peer.network_stats.download_rate(),
+            });
+        }
+
+        TorrentView {
+            info: self.info.clone(),
+            peers,
+            progress: (self.bitfield.num_set() as f64) / (self.bitfield.len() as f64),
+            state: match self.mode {
+                TorrentMode::Starting => TorrentViewState::Running,
+                TorrentMode::Checking => TorrentViewState::Checking,
+                TorrentMode::Running => TorrentViewState::Running,
+                TorrentMode::Paused => TorrentViewState::Paused,
+                TorrentMode::Failed => TorrentViewState::Paused,
+            },
+        }
     }
 }
 
@@ -940,78 +972,6 @@ impl TorrentState {
     }
 }
 
-impl TorrentState {
-    pub fn view(&self) -> TorrentView {
-        let mut peers = Vec::with_capacity(self.peers.len());
-        for peer in self.peers.values() {
-            peers.push(TorrentViewPeer {
-                id: peer.id,
-                addr: peer.addr,
-                upload_rate: peer.network_stats.upload_rate(),
-                download_rate: peer.network_stats.download_rate(),
-            });
-        }
-
-        TorrentView {
-            info: self.info.clone(),
-            peers,
-            progress: (self.bitfield.num_set() as f64) / (self.bitfield.len() as f64),
-            state: match self.mode {
-                TorrentMode::Starting => TorrentViewState::Running,
-                TorrentMode::Checking => TorrentViewState::Checking,
-                TorrentMode::Running => TorrentViewState::Running,
-                TorrentMode::Paused => TorrentViewState::Paused,
-                TorrentMode::Failed => TorrentViewState::Paused,
-            },
-        }
-    }
-}
-
-fn torrent_process_tick(state: &mut TorrentState) {
-    if state.mode == TorrentMode::Running {
-        state.check_peer_interests();
-        state.request_chunks();
-
-        if state.config.use_trackers {
-            state.trackers_announce();
-        }
-    }
-}
-
-// fn torrent_process_peer_connected(
-//     state: &mut TorrentState,
-//     peer_id: PeerId,
-//     peer_io: PeerIo,
-//     peer_addr: SocketAddr,
-// ) {
-//     todo!()
-//     // if state.peer_with_addr_exists(peer_addr) {
-//     //     tracing::warn!(addr = ?peer_addr, "peer with same addr is already connected");
-//     //     return;
-//     // }
-//     //
-//     // tracing::info!(addr = ?peer_addr, "peer connected");
-//     // let info = state.info.clone();
-//     // let sender = state.sender.clone();
-//     // let peer_id = state.id;
-//     // let bitfield = state.bitfield.clone();
-//     // state.peers.insert_with_key(move |key| {
-//     //     let peer_proc = PeerProc::accept(
-//     //         sender,
-//     //         torrent_key,
-//     //         peer_key,
-//     //         info_hash,
-//     //         local_peer_id,
-//     //         peer_io,
-//     //     );
-//     //     let peer_io = PeerIOOld::accept(key, info, peer_id, sender, stream);
-//     //     peer_io.send(Message::Bitfield {
-//     //         bitfield: bitfield.into_vec(),
-//     //     });
-//     //     PeerState::new(peer_io, addr)
-//     // });
-// }
-
 fn request_message_from_chunk(chunk: &ChunkState) -> wire::Message {
     wire::Message::Request {
         index: chunk.piece.to_index(),
@@ -1020,48 +980,10 @@ fn request_message_from_chunk(chunk: &ChunkState) -> wire::Message {
     }
 }
 
-// fn torrent_entry(mut state: TorrentState) {
-//     state.trackers_add_default();
-//     state.check();
-//     loop {
-//         let result = state.receiver.recv_timeout(Duration::from_secs(1));
-//         match result {
-//             Ok(msg) => state.queue_message(msg),
-//             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-//             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-//         }
-//         state.process();
-//     }
-// }
-
 fn extract_tracker_urls(info: &TorrentInfo) -> Vec<String> {
     if info.trackers().is_empty() {
         vec![info.announce().clone()]
     } else {
         info.trackers().iter().cloned().collect()
     }
-}
-
-fn extract_udp_tracker_addresses(info: &Metainfo) -> Vec<SocketAddr> {
-    fn try_add_addr(out: &mut Vec<SocketAddr>, url: &str) {
-        if let Some(addr_str) = url.strip_prefix("udp://") {
-            if let Ok(mut addrs) = addr_str.to_socket_addrs() {
-                if let Some(addr) = addrs.next() {
-                    out.push(addr);
-                }
-            }
-        }
-    }
-
-    let mut addrs = Vec::new();
-    if info.announce_list.is_empty() {
-        try_add_addr(&mut addrs, &info.announce);
-    } else {
-        for group in info.announce_list.iter() {
-            for url in group.iter() {
-                try_add_addr(&mut addrs, url);
-            }
-        }
-    }
-    addrs
 }
