@@ -76,6 +76,7 @@ impl PeerIo {
 enum SessionMsg {
     ListenerIncoming {
         peer_id: PeerId,
+        peer_addr: SocketAddr,
         info_hash: Sha1,
         peer_io: PeerIo,
     },
@@ -125,6 +126,10 @@ enum SessionMsg {
         config: TorrentConfig,
         response: oneshot::Sender<Torrent>,
     },
+    TorrentConnect {
+        torrent_key: TorrentKey,
+        address: SocketAddr,
+    },
     TorrentView {
         torrent_key: TorrentKey,
         response: oneshot::Sender<TorrentView>,
@@ -137,6 +142,7 @@ impl SessionMsg {
         match self {
             SessionMsg::ListenerIncoming {
                 peer_id: _,
+                peer_addr: _,
                 info_hash: _,
                 peer_io: _,
             } => None,
@@ -154,6 +160,10 @@ impl SessionMsg {
                 config: _,
                 response: _,
             } => None,
+            SessionMsg::TorrentConnect {
+                torrent_key,
+                address: _,
+            } => Some(*torrent_key),
             SessionMsg::TorrentView { torrent_key, .. } => Some(*torrent_key),
             SessionMsg::Shutdown => None,
         }
@@ -266,9 +276,10 @@ fn session_process(state: &mut SessionState, msg: SessionMsg) -> bool {
     match msg {
         SessionMsg::ListenerIncoming {
             peer_id,
+            peer_addr,
             info_hash,
             peer_io,
-        } => session_process_listener_incoming(state, peer_id, info_hash, peer_io),
+        } => session_process_listener_incoming(state, peer_id, peer_addr, info_hash, peer_io),
         SessionMsg::PeerHandshake {
             torrent_key,
             peer_key,
@@ -315,6 +326,12 @@ fn session_process(state: &mut SessionState, msg: SessionMsg) -> bool {
             config,
             response,
         } => session_process_torrent_add(state, info, config, response),
+        SessionMsg::TorrentConnect {
+            torrent_key,
+            address,
+        } => {
+            session_process_torrent_connect(state, torrent_key, address);
+        }
         SessionMsg::TorrentView {
             torrent_key,
             response,
@@ -332,10 +349,25 @@ fn session_process(state: &mut SessionState, msg: SessionMsg) -> bool {
 fn session_process_listener_incoming(
     state: &mut SessionState,
     peer_id: PeerId,
+    peer_addr: SocketAddr,
     info_hash: Sha1,
     peer_io: PeerIo,
 ) {
-    todo!()
+    for (torrent_key, torrent) in state.torrents.iter_mut() {
+        if torrent.state.info_hash() == info_hash {
+            let peer_key = torrent.state.on_peer_connect(peer_id, peer_addr);
+            let peer_proc = PeerProc::accept(
+                state.sender.clone(),
+                torrent_key,
+                peer_key,
+                info_hash,
+                torrent.state.id(),
+                peer_io,
+            );
+            torrent.peers.insert(peer_key, peer_proc);
+            break;
+        }
+    }
 }
 
 fn session_process_peer_handshake(
@@ -450,6 +482,15 @@ fn session_process_torrent_add(
     session_torrent_drain_and_execute(state, key);
 }
 
+fn session_process_torrent_connect(
+    state: &mut SessionState,
+    torrent_key: TorrentKey,
+    address: SocketAddr,
+) {
+    let torrent = torrent_or_return!(state, mut torrent_key);
+    torrent.state.connect(address);
+}
+
 fn session_process_torrent_view(
     state: &mut SessionState,
     torrent_key: TorrentKey,
@@ -528,6 +569,13 @@ impl Torrent {
     pub async fn completed(&self) -> bool {
         let view = self.view().await;
         view.complete()
+    }
+
+    pub fn connect(&self, addr: SocketAddr) {
+        self.send(SessionMsg::TorrentConnect {
+            torrent_key: self.key,
+            address: addr,
+        });
     }
 
     pub async fn view(&self) -> TorrentView {

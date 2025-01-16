@@ -69,6 +69,7 @@ async fn accept(sender: SessionSender, mut stream: TcpStream, addr: SocketAddr) 
     let peer_io = PeerIo::new(reader, writer);
     let _ = sender.send(SessionMsg::ListenerIncoming {
         peer_id: handshake.peer_id,
+        peer_addr: addr,
         info_hash: handshake.info_hash,
         peer_io,
     });

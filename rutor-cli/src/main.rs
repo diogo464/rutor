@@ -15,7 +15,7 @@ use ratatui::{
     widgets::{Block, Borders, LineGauge, Padding, Row, Table},
     DefaultTerminal, Frame,
 };
-use rutor::{Torrent, TorrentConfig, TorrentInfo, TorrentView, TorrentViewState};
+use rutor::{TorrentInfo, TorrentView, TorrentViewState};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use tui_logger::{TuiLoggerLevelOutput, TuiLoggerWidget};
 
@@ -99,13 +99,15 @@ async fn main() -> Result<()> {
     result
 }
 
-async fn run(args: Args, terminal: DefaultTerminal) -> Result<()> {
+async fn run(mut args: Args, terminal: DefaultTerminal) -> Result<()> {
     let content = std::fs::read(&args.torrent).unwrap();
     let torrent_info = TorrentInfo::decode(&content)?;
-    let session = rutor::Session::new();
+    let session_config = rutor::SessionConfig {
+        listen_addr: args.listen,
+    };
+    let session = rutor::Session::new_with(session_config);
     let torrent_config = rutor::TorrentConfig {
         use_trackers: !args.no_trackers,
-        listen: args.listen,
         assume_complete: args.assume_complete,
         ..Default::default()
     };
@@ -122,6 +124,12 @@ async fn run(args: Args, terminal: DefaultTerminal) -> Result<()> {
     loop {
         tokio::time::sleep(Duration::from_millis(500)).await;
         let view = torrent.view().await;
+        if view.state == TorrentViewState::Running && !args.peers.is_empty() {
+            for peer in &args.peers {
+                torrent.connect(*peer);
+            }
+            args.peers.clear();
+        }
         render_state.lock().unwrap().view = view;
         if torrent.completed().await && !args.seed || render_handle.is_finished() {
             break;

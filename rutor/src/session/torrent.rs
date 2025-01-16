@@ -38,7 +38,6 @@ impl PieceKey {
 #[derive(Debug)]
 pub struct TorrentConfig {
     pub use_trackers: bool,
-    pub listen: Option<SocketAddr>,
     pub assume_complete: bool,
 }
 
@@ -46,7 +45,6 @@ impl Default for TorrentConfig {
     fn default() -> Self {
         Self {
             use_trackers: true,
-            listen: None,
             assume_complete: false,
         }
     }
@@ -111,7 +109,27 @@ struct PeerState {
 }
 
 impl PeerState {
-    pub fn new(key: PeerKey, addr: SocketAddr) -> Self {
+    /// Create a new incoming peer state
+    /// We already know the peer id and address since we read the handshake
+    pub fn new_incoming(key: PeerKey, id: PeerId, addr: SocketAddr) -> Self {
+        Self {
+            id,
+            key,
+            addr,
+            network_stats: Default::default(),
+            handshake_received: true,
+            bitfield_received: false,
+            bitfield: Default::default(),
+            remote_choke: true,
+            local_choke: true,
+            remote_interested: false,
+            local_interested: false,
+            pending_chunks: Default::default(),
+            remote_requests: Default::default(),
+        }
+    }
+
+    pub fn new_outgoing(key: PeerKey, addr: SocketAddr) -> Self {
         Self {
             id: Default::default(),
             key,
@@ -355,9 +373,26 @@ impl TorrentState {
             }
         }
     }
+
+    pub fn connect(&mut self, address: SocketAddr) {
+        self.process_connect_to_peer(address);
+    }
 }
 
 impl TorrentState {
+    pub fn on_peer_connect(&mut self, peer_id: PeerId, peer_addr: SocketAddr) -> PeerKey {
+        let key = self
+            .peers
+            .insert_with_key(|key| PeerState::new_incoming(key, peer_id, peer_addr));
+        self.queue.send(
+            key,
+            wire::Message::Bitfield {
+                bitfield: self.bitfield.clone().into_vec(),
+            },
+        );
+        key
+    }
+
     pub fn on_peer_handshake(&mut self, peer_key: PeerKey, peer_id: PeerId) {
         let peer = match self.peers.get_mut(peer_key) {
             Some(peer) => peer,
@@ -620,7 +655,9 @@ impl TorrentState {
             return;
         }
 
-        let key = self.peers.insert_with_key(|key| PeerState::new(key, addr));
+        let key = self
+            .peers
+            .insert_with_key(|key| PeerState::new_outgoing(key, addr));
         self.queue.connect(key, addr);
     }
 
