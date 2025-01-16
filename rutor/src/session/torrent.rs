@@ -1,6 +1,6 @@
 use std::{
     collections::VecDeque,
-    net::{SocketAddr, ToSocketAddrs as _},
+    net::SocketAddr,
     path::PathBuf,
     time::{Duration, Instant},
 };
@@ -9,8 +9,8 @@ use bytes::{Bytes, BytesMut};
 use slotmap::{Key as _, SecondaryMap, SlotMap};
 
 use crate::{
-    wire, Announce, AnnounceParams, Event, Metainfo, NetworkStatsAccum, PeerId, PieceBitfield,
-    PieceIdx, Sha1, TorrentInfo, TorrentView, TorrentViewPeer, TorrentViewState,
+    wire, Announce, AnnounceParams, Event, NetworkStatsAccum, PeerId, PieceBitfield, PieceIdx,
+    Sha1, TorrentInfo, TorrentView, TorrentViewPeer, TorrentViewState,
 };
 
 const CHUNK_LENGTH: u32 = 16 * 1024;
@@ -271,14 +271,14 @@ impl TorrentState {
             let mut current_offset = 0;
             let parent_path = PathBuf::from(info.name());
             for file in info.files() {
-                let path = parent_path.join(PathBuf::from(file.path.clone()));
+                let path = parent_path.join(PathBuf::from(file.path()));
                 let file_key = files.insert(FileState {
                     path,
                     offset: current_offset,
-                    length: file.length,
+                    length: file.length(),
                 });
                 file_keys.push(file_key);
-                current_offset += file.length;
+                current_offset += file.length();
             }
         }
 

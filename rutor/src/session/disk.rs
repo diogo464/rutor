@@ -110,7 +110,7 @@ async fn attempt_read_piece(info: &TorrentInfo, piece_idx: PieceIdx) -> std::io:
             .create(false)
             .write(false)
             .read(true)
-            .open(&range.file.path)
+            .open(range.file.path())
             .await?;
         file.seek(std::io::SeekFrom::Start(range.file_start))
             .await?;
@@ -123,7 +123,7 @@ async fn attempt_read_piece(info: &TorrentInfo, piece_idx: PieceIdx) -> std::io:
 async fn write(state: &mut State, idx: PieceIdx, data: Bytes) {
     for range in state.info.files_from_piece(idx) {
         match attempt_write_piece(
-            &range.file.path,
+            range.file.path(),
             range.file_start,
             &data[range.piece_range()],
         )

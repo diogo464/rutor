@@ -104,9 +104,9 @@ impl Wire for PeerId {
     }
 
     fn decode<R: Read>(mut reader: R) -> std::io::Result<Self> {
-        let mut peer_id = PeerId::default();
-        reader.read_exact(&mut peer_id.0)?;
-        Ok(peer_id)
+        let mut peer_id = [0u8; 20];
+        reader.read_exact(&mut peer_id)?;
+        Ok(PeerId::new(peer_id))
     }
 }
 

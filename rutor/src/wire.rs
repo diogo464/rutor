@@ -150,7 +150,7 @@ pub fn read_handshake<R: Read>(mut reader: R) -> std::io::Result<Handshake> {
 
     Ok(Handshake {
         info_hash: Sha1(*split.info_hash),
-        peer_id: PeerId(*split.peer_id),
+        peer_id: PeerId::new(*split.peer_id),
     })
 }
 
@@ -165,7 +165,7 @@ pub async fn read_handshake_async<R: AsyncRead + Unpin>(
 
     Ok(Handshake {
         info_hash: Sha1(*split.info_hash),
-        peer_id: PeerId(*split.peer_id),
+        peer_id: PeerId::new(*split.peer_id),
     })
 }
 
