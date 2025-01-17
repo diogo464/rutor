@@ -134,6 +134,22 @@ pub fn encode<T: Encode>(value: T) -> Vec<u8> {
     encode_with(&EncoderConfig::default(), value)
 }
 
+pub fn encode_fn_with(config: &EncoderConfig, f: impl FnOnce(&mut Encoder)) -> Vec<u8> {
+    let mut buf = Vec::new();
+    {
+        let mut encoder = Encoder {
+            config,
+            buf: &mut buf,
+        };
+        f(&mut encoder);
+    }
+    buf
+}
+
+pub fn encode_fn(f: impl FnOnce(&mut Encoder)) -> Vec<u8> {
+    encode_fn_with(&EncoderConfig::default(), f)
+}
+
 macro_rules! impl_encode_for_integer {
     ($t:ty) => {
         impl Encode for $t {

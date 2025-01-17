@@ -15,7 +15,7 @@ use ratatui::{
     widgets::{Block, Borders, LineGauge, Padding, Row, Table},
     DefaultTerminal, Frame,
 };
-use rutor::{TorrentInfo, TorrentView, TorrentViewState};
+use rutor::{Sha1, TorrentInfo, TorrentView, TorrentViewState};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use tui_logger::{TuiLoggerLevelOutput, TuiLoggerWidget};
 

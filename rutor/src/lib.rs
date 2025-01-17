@@ -4,6 +4,9 @@ pub use hash::Sha1;
 mod info;
 pub use info::{TorrentFile, TorrentFileRange, TorrentInfo};
 
+mod creator;
+pub use creator::{TorrentCreator, TorrentCreatorConfig, TorrentCreatorFile};
+
 mod tracker;
 pub use tracker::{Action, Announce, AnnounceParams, Event, TrackerUdpClient};
 

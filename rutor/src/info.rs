@@ -281,14 +281,6 @@ pub struct Info {
     pub files: Vec<InfoFile>,
 }
 
-impl Info {
-    pub fn piece_length(&self, index: u32) -> u32 {
-        let mut l = self.length;
-        l = l.saturating_sub(u64::from(index) * u64::from(self.piece_length));
-        l.min(u64::from(self.piece_length)) as u32
-    }
-}
-
 impl bencode::FromValue for InfoFile {
     fn from_value(value: &bencode::Value) -> bencode::Result<Self> {
         let dict = value.as_dict()?;
