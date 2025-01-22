@@ -15,7 +15,7 @@ use ratatui::{
     widgets::{Block, Borders, LineGauge, Padding, Row, Table},
     DefaultTerminal, Frame,
 };
-use rutor::{Sha1, TorrentInfo, TorrentView, TorrentViewState};
+use rutor::{TorrentInfo, TorrentView, TorrentViewState};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use tui_logger::{TuiLoggerLevelOutput, TuiLoggerWidget};
 
@@ -55,6 +55,24 @@ impl std::fmt::Display for ByteRateDisplay {
 
 #[derive(Debug, Parser)]
 struct Args {
+    #[clap(subcommand)]
+    subcmd: SubCommand,
+}
+
+#[derive(Debug, Parser)]
+enum SubCommand {
+    View(ViewArgs),
+    Download(DownloadArgs),
+}
+
+#[derive(Debug, Parser)]
+struct ViewArgs {
+    #[clap(default_value = "bunny.torrent")]
+    torrent: String,
+}
+
+#[derive(Debug, Parser)]
+struct DownloadArgs {
     #[clap(default_value = "bunny.torrent")]
     torrent: String,
 
@@ -83,7 +101,6 @@ struct RenderSharedState {
 async fn main() -> Result<()> {
     let args = Args::parse();
     color_eyre::install().unwrap();
-    let terminal = ratatui::init();
     //let fmt_layer = tracing_subscriber::fmt::layer().with_target(false);
     let filter_layer = tracing_subscriber::EnvFilter::try_from_default_env()
         .or_else(|_| tracing_subscriber::EnvFilter::try_new("info"))
@@ -94,12 +111,28 @@ async fn main() -> Result<()> {
         .with(tui_logger::tracing_subscriber_layer())
         .with(filter_layer)
         .init();
-    let result = run(args, terminal).await;
+
+    match args.subcmd {
+        SubCommand::View(args) => view(args).await,
+        SubCommand::Download(args) => download(args).await,
+    }
+}
+
+async fn view(args: ViewArgs) -> Result<()> {
+    let content = tokio::fs::read(&args.torrent).await?;
+    let torrent_info = TorrentInfo::decode(&content)?;
+    println!("{:#?}", torrent_info);
+    Ok(())
+}
+
+async fn download(args: DownloadArgs) -> Result<()> {
+    let terminal = ratatui::init();
+    let result = download_run(args, terminal).await;
     ratatui::restore();
     result
 }
 
-async fn run(mut args: Args, terminal: DefaultTerminal) -> Result<()> {
+async fn download_run(mut args: DownloadArgs, terminal: DefaultTerminal) -> Result<()> {
     let content = std::fs::read(&args.torrent).unwrap();
     let torrent_info = TorrentInfo::decode(&content)?;
     let session_config = rutor::SessionConfig {
