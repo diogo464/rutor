@@ -1,8 +1,8 @@
-use std::{net::ToSocketAddrs as _, time::Duration};
+use std::time::Duration;
 
 use tokio::{sync::mpsc, task::AbortHandle};
 
-use crate::{AnnounceParams, TrackerUdpClient};
+use crate::{tracker::TrackerClient, AnnounceParams};
 
 use super::{SessionMsg, SessionSender, TorrentKey, TrackerKey};
 
@@ -78,7 +78,7 @@ async fn entry(
             };
         }
 
-        let mut client = match tracker_create_client(&url).await {
+        let mut client = match TrackerClient::new(&url).await {
             Ok(client) => client,
             Err(error) => {
                 let _ = sender.send(SessionMsg::TrackerError {
@@ -111,33 +111,18 @@ async fn entry(
     }
 }
 
-async fn tracker_create_client(url: &str) -> std::io::Result<TrackerUdpClient> {
-    let url = match url.strip_prefix("udp://") {
-        Some(url) => url,
-        None => return Err(std::io::Error::other("unsupported tracker protocol")),
-    };
-
-    let mut addrs = tokio::task::block_in_place(|| url.to_socket_addrs())?;
-    let addr = match addrs.next() {
-        Some(addr) => addr,
-        None => return Err(std::io::Error::other("failed to resolve tracker url")),
-    };
-
-    tokio::task::block_in_place(move || TrackerUdpClient::new(addr))
-}
-
 async fn tracker_loop(
     sender: &SessionSender,
     receiver: &mut TrackerReceiver,
     torrent_key: TorrentKey,
     tracker_key: TrackerKey,
-    client: &mut TrackerUdpClient,
+    client: &mut TrackerClient,
 ) -> std::io::Result<()> {
     while let Some(msg) = receiver.recv().await {
         match msg {
             TrackerMsg::Announce(params) => {
                 // TODO: make async
-                let response = tokio::task::block_in_place(|| client.announce(&params))?;
+                let response = client.announce(&params).await?;
                 let _ = sender.send(SessionMsg::TrackerAnnounce {
                     torrent_key,
                     tracker_key,

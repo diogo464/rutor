@@ -8,7 +8,7 @@ mod creator;
 pub use creator::{TorrentCreator, TorrentCreatorConfig, TorrentCreatorFile};
 
 mod tracker;
-pub use tracker::{Action, Announce, AnnounceParams, Event, TrackerUdpClient};
+pub use tracker::{Action, Announce, AnnounceParams, Event};
 
 mod wire;
 pub use wire::Message;

@@ -786,10 +786,11 @@ impl TorrentState {
 
     fn tracker_add(&mut self, url: String) {
         if self.tracker_with_url_exists(&url) {
+            tracing::warn!("tracker with url {url} already exists");
             return;
         }
 
-        //println!("adding tracker {url}");
+        tracing::info!("adding tracker {url}");
         let key = self.trackers.insert_with_key({
             let url = url.clone();
             move |key| TrackerState {
