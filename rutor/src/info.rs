@@ -21,8 +21,8 @@ impl std::fmt::Debug for TorrentInfoInner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Torrent \n\tAnnounce : {:?}\n\tName : {:?}\n\tComment : {:?}\n\tCreator : {:?}\n\tPiece length : {:?}\n\tFiles : {:#?}\n",
-            self.announce, self.name, self.comment, self.creator, self.piece_length, self.files
+            "Torrent \n\tAnnounce : {:?}\n\tName : {:?}\n\tInfo Hash : {}\n\tComment : {:?}\n\tCreator : {:?}\n\tPiece length : {:?}\n\tFiles : {:#?}\n",
+            self.announce, self.name, self.info_hash, self.comment, self.creator, self.piece_length, self.files
         )
     }
 }
