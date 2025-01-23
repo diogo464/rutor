@@ -11,6 +11,12 @@ impl PeerId {
     }
 }
 
+impl From<[u8; 20]> for PeerId {
+    fn from(bytes: [u8; 20]) -> Self {
+        Self(bytes)
+    }
+}
+
 impl std::fmt::Debug for PeerId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("PeerId(")?;

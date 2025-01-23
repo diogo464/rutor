@@ -21,7 +21,7 @@ pub enum Event {
     Stopped = 3,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Default, Clone)]
 pub struct AnnounceParams {
     pub info_hash: Sha1,
     pub peer_id: PeerId,

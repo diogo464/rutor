@@ -7,7 +7,7 @@ pub use info::{TorrentFile, TorrentFileRange, TorrentInfo};
 mod creator;
 pub use creator::{TorrentCreator, TorrentCreatorConfig, TorrentCreatorFile};
 
-mod tracker;
+pub mod tracker;
 pub use tracker::{Action, Announce, AnnounceParams, Event};
 
 mod wire;

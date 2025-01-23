@@ -558,6 +558,7 @@ impl TorrentState {
             None => return,
         };
 
+        tracing::info!("tracker {} announced: {:#?}", tracker.url, announce);
         tracker.next_announce = Instant::now() + Duration::from_secs(u64::from(announce.interval));
         tracker.status = format!("ok");
 
@@ -570,6 +571,7 @@ impl TorrentState {
             None => return,
         };
 
+        tracing::warn!("tracker {} error: {error}", tracker.url);
         tracker.next_announce = Instant::now() + Duration::from_secs(15);
         tracker.status = format!("error: {error}");
     }
@@ -775,6 +777,7 @@ impl TorrentState {
 
     fn trackers_add_default(&mut self) {
         let urls = extract_tracker_urls(&self.info);
+        tracing::info!("adding default trackers: {urls:?}");
         for url in urls {
             self.tracker_add(url);
         }
@@ -818,12 +821,11 @@ impl TorrentState {
             downloaded: 0,
             left: 0,
             uploaded: 0,
-            event: Event::None,
-            ip_address: None,
-            num_want: None,
-            port: 0,
+            event: Event::Started,
+            ..Default::default()
         };
 
+        tracing::info!("announcing to {} trackers", trackers.len());
         for key in trackers {
             self.tracker_announce(key, &params);
         }

@@ -1,6 +1,12 @@
 #[derive(Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Sha1(pub(crate) [u8; 20]);
 
+impl From<[u8; 20]> for Sha1 {
+    fn from(bytes: [u8; 20]) -> Self {
+        Self(bytes)
+    }
+}
+
 impl Sha1 {
     pub fn hash(buf: &[u8]) -> Sha1 {
         use sha1::Digest;
